@@ -18,6 +18,7 @@ class WalkieTalkieService {
   late final WebSocketService _webSocketService;
 
   ConnectionStatus _connectionStatus = ConnectionStatus.disconnected;
+  bool _useAecProcessedAudio = true; // Prefer AEC-processed audio when available
   String? _nickname;
 
   final StreamController<ConnectionStatus> _connectionStatusController =
@@ -43,8 +44,16 @@ class WalkieTalkieService {
     );
 
     _audioPlaybackService = AudioPlaybackService(
+      onPlay: () => _log('🔊 Starting audio playback'),
+      onStop: () => _log('🔇 Audio playback stopped'),
       onLog: _log,
       onError: _logError,
+      onCaptureFrame: (audioData) {
+        // Send the processed audio data to WebSocket
+        if (_connectionStatus == ConnectionStatus.connected) {
+          _webSocketService.sendAudioData(Uint8List.fromList(audioData));
+        }
+      },
     );
 
     _webSocketService = WebSocketService(
@@ -54,9 +63,9 @@ class WalkieTalkieService {
       onAudioData: _onWebSocketAudioData,
     );
 
-    // Connect microphone to WebSocket
+    // Connect microphone to WebSocket (as fallback when AEC is not available)
     _microphoneService.audioDataStream.listen((audioData) {
-      if (_connectionStatus == ConnectionStatus.connected) {
+      if (_connectionStatus == ConnectionStatus.connected && !_useAecProcessedAudio) {
         _webSocketService.sendAudioData(audioData);
       }
     });
