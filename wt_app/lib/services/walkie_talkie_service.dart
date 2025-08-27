@@ -57,7 +57,17 @@ class WalkieTalkieService {
       onCaptureFrame: (audioData) {
         // Send the processed audio data to WebSocket
         if (_connectionStatus == ConnectionStatus.connected && _useAecProcessedAudio) {
-          _webSocketService.sendAudioData(Uint8List.fromList(audioData));
+          // audioData are 16-bit PCM samples (-32768..32767). We must send as little-endian bytes.
+          final sampleCount = audioData.length;
+          final bytes = Uint8List(sampleCount * 2);
+          int bi = 0;
+          for (var s in audioData) {
+            // Ensure signed 16-bit range then encode LE
+            final v = s & 0xFFFF; // mask to 16 bits
+            bytes[bi++] = v & 0xFF; // low byte
+            bytes[bi++] = (v >> 8) & 0xFF; // high byte
+          }
+          _webSocketService.sendAudioData(bytes);
         }
       },
     );

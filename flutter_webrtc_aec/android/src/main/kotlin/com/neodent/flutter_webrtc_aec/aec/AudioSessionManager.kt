@@ -229,6 +229,19 @@ class AudioSessionManager(
             -1
         }
     }
+
+    /**
+     * Read audio data with explicit offset/length (avoids temporary arrays in tight loop)
+     */
+    fun readCaptureData(buffer: ShortArray, offset: Int, length: Int): Int {
+        return try {
+            if (offset < 0 || length < 0 || offset + length > buffer.size) return -1
+            audioRecord?.read(buffer, offset, length) ?: -1
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading capture data (offset)", e)
+            -1
+        }
+    }
     
     /**
      * Release audio session and all resources

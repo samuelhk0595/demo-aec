@@ -90,6 +90,14 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
             try {
                 System.arraycopy(audioMono10ms, 0, renderBuffer, 0, frameSamples)
                 val result = apm?.ProcessRenderStream(renderBuffer, 0) ?: -1
+                if (renderFrameCount % 200L == 0L) {
+                    var peak = 0
+                    for (s in renderBuffer) {
+                        val a = kotlin.math.abs(s.toInt())
+                        if (a > peak) peak = a
+                    }
+                    Log.d(TAG, "Render frame=${renderFrameCount} peak=$peak")
+                }
                 
                 // Track render stream timing
                 renderFrameCount++
@@ -154,6 +162,20 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                     -11 // Simulate sync issue to use fallback
                 }
                 
+                if (captureFrameCount % 200L == 0L) {
+                    var peakIn = 0
+                    for (s in inputMono10ms) {
+                        val a = kotlin.math.abs(s.toInt())
+                        if (a > peakIn) peakIn = a
+                    }
+                    var peakOut = 0
+                    for (s in captureBuffer) {
+                        val a = kotlin.math.abs(s.toInt())
+                        if (a > peakOut) peakOut = a
+                    }
+                    Log.d(TAG, "Capture frame=${captureFrameCount} peakIn=$peakIn peakOut=$peakOut ratio=${String.format("%.2f", if (captureFrameCount>0) renderFrameCount.toDouble()/captureFrameCount else 0.0)} recentRender=${hasRecentRenderData} renderTooFast=$isRenderTooFast")
+                }
+
                 if (result == 0) {
                     // Copy processed audio to output
                     System.arraycopy(captureBuffer, 0, outputMono10ms, 0, frameSamples)

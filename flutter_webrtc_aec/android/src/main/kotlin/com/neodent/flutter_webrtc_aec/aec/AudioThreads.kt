@@ -165,6 +165,8 @@ class AudioThreads(
             val monoBuffer = ShortArray(frameSize)
             val silenceBuffer = ShortArray(frameSize) // For when no audio is available
             silenceBuffer.fill(0) // Fill with silence
+            val nanosPerFrame = 10_000_000L
+            var nextDeadline = System.nanoTime()
             
             try {
                 while (isRunning.get()) {
@@ -197,14 +199,22 @@ class AudioThreads(
                                 Log.w(TAG, "Failed to write playback data")
                             }
                         } else {
-                            // No audio data available, feed silence to maintain APM timing
-                            // This happens when MP3 is playing through MediaPlayer or we're starved.
-                            // Even when an external feeder is active we still provide silence here
-                            // to keep cadence if it temporarily stalls.
+                            // No queued audio. Feed silence to maintain timing (safe even if external feeder also active;
+                            // duplication of silent frame is benign, and ensures cadence during pauses of external feeder).
                             apmEngine.pushRenderMono(silenceBuffer)
-                            
-                            // Small delay to maintain 10ms frame timing
-                            Thread.sleep(10)
+                        }
+
+                        // Precise pacing: aim for one iteration per 10ms without cumulative drift
+                        nextDeadline += nanosPerFrame
+                        val now = System.nanoTime()
+                        var sleepNanos = nextDeadline - now
+                        if (sleepNanos < 0) {
+                            // We're late; reset schedule to now to avoid spiral of lateness
+                            nextDeadline = now
+                            sleepNanos = 0
+                        }
+                        if (sleepNanos > 0) {
+                            Thread.sleep(sleepNanos / 1_000_000L, (sleepNanos % 1_000_000L).toInt())
                         }
                         
                     } catch (e: InterruptedException) {
@@ -228,6 +238,8 @@ class AudioThreads(
             
             val inputBuffer = ShortArray(frameSize)
             val outputBuffer = ShortArray(frameSize)
+            val nanosPerFrame = 10_000_000L
+            var nextDeadline = System.nanoTime()
             
             try {
                 while (isRunning.get()) {
@@ -235,16 +247,26 @@ class AudioThreads(
                         // Read audio from microphone
                         var totalRead = 0
                         while (totalRead < frameSize && isRunning.get()) {
-                            val samplesRead = audioSession.readCaptureData(
-                                inputBuffer.sliceArray(totalRead until frameSize)
-                            )
-                            
+                            val remaining = frameSize - totalRead
+                            val samplesRead = audioSession.readCaptureData(inputBuffer, totalRead, remaining)
                             if (samplesRead > 0) {
                                 totalRead += samplesRead
-                            } else if (samplesRead < 0) {
+                            } else if (samplesRead == 0) {
+                                // Yield briefly to avoid busy-spin if driver returns 0
+                                Thread.sleep(2)
+                            } else {
                                 Log.w(TAG, "Error reading capture data: $samplesRead")
                                 break
                             }
+                        }
+                        // Attempt pacing alignment with render to reduce jitter in AEC delay estimation
+                        nextDeadline += nanosPerFrame
+                        val now = System.nanoTime()
+                        val sleepNanos = nextDeadline - now
+                        if (sleepNanos > 0) {
+                            Thread.sleep(sleepNanos / 1_000_000L, (sleepNanos % 1_000_000L).toInt())
+                        } else if (sleepNanos < -20_000_000L) { // if we are >20ms late, resync clock
+                            nextDeadline = now
                         }
                         
                         if (totalRead == frameSize) {
