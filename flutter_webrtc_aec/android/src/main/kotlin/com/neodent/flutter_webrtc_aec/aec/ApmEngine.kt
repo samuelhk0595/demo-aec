@@ -14,6 +14,7 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
     companion object {
         private const val TAG = "ApmEngine"
         private const val FRAME_DURATION_MS = 10
+        private const val RENDER_BUFFER_FRAMES = 5 // Buffer 5 frames to ensure sync
     }
     
     private var apm: Apm? = null
@@ -23,6 +24,11 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
     // Buffers for audio processing
     private val renderBuffer = ShortArray(frameSamples)
     private val captureBuffer = ShortArray(frameSamples)
+    
+    // Render stream tracking for better synchronization
+    private var renderFrameCount = 0L
+    private var captureFrameCount = 0L
+    private var lastRenderTime = 0L
     
     @Volatile
     private var isInitialized = false
@@ -84,6 +90,11 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
             try {
                 System.arraycopy(audioMono10ms, 0, renderBuffer, 0, frameSamples)
                 val result = apm?.ProcessRenderStream(renderBuffer, 0) ?: -1
+                
+                // Track render stream timing
+                renderFrameCount++
+                lastRenderTime = System.currentTimeMillis()
+                
                 if (result != 0) {
                     Log.d(TAG, "Render stream processing result: $result")
                 }
@@ -109,11 +120,39 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
         
         return lock.withLock {
             try {
+                // Check if we have recent render data for proper AEC synchronization
+                val timeSinceLastRender = System.currentTimeMillis() - lastRenderTime
+                val hasRecentRenderData = timeSinceLastRender < 100 // 100ms tolerance
+                
+                // Check frame ratio to detect if render is being fed too fast
+                val frameRatio = if (captureFrameCount > 0) renderFrameCount.toDouble() / captureFrameCount else 0.0
+                val isRenderTooFast = frameRatio > 1.5 // Render is 50% faster than capture
+                
+                captureFrameCount++
+                
                 // Copy input to internal buffer
                 System.arraycopy(inputMono10ms, 0, captureBuffer, 0, frameSamples)
                 
-                // Process with APM (modifies buffer in-place)
-                val result = apm?.ProcessCaptureStream(captureBuffer, 0) ?: -1
+                // Only attempt AEC processing if synchronization is good
+                val result = if (hasRecentRenderData && renderFrameCount > RENDER_BUFFER_FRAMES && !isRenderTooFast) {
+                    apm?.ProcessCaptureStream(captureBuffer, 0) ?: -1
+                } else {
+                    // Skip AEC processing if sync conditions are not met
+                    if (!hasRecentRenderData) {
+                        if (captureFrameCount % 100 == 1L) {
+                            Log.d(TAG, "Skipping AEC: no recent render data (${timeSinceLastRender}ms ago)")
+                        }
+                    } else if (isRenderTooFast) {
+                        if (captureFrameCount % 100 == 1L) {
+                            Log.d(TAG, "Skipping AEC: render too fast (ratio=${String.format("%.2f", frameRatio)}, render=$renderFrameCount, capture=$captureFrameCount)")
+                        }
+                    } else {
+                        if (captureFrameCount % 100 == 1L) {
+                            Log.d(TAG, "Skipping AEC: waiting for render buffer (${renderFrameCount}/${RENDER_BUFFER_FRAMES})")
+                        }
+                    }
+                    -11 // Simulate sync issue to use fallback
+                }
                 
                 if (result == 0) {
                     // Copy processed audio to output
@@ -123,7 +162,10 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                     // APM processing failed, but continue with unprocessed audio
                     // This can happen if render stream is not properly synchronized
                     if (result == -11) {
-                        Log.d(TAG, "APM processing failed (render stream sync issue): $result")
+                        // Reduce log frequency for sync issues
+                        if (captureFrameCount % 100 == 1L) {
+                            Log.d(TAG, "APM processing failed (render stream sync issue): $result - frames: render=$renderFrameCount, capture=$captureFrameCount")
+                        }
                     } else {
                         Log.w(TAG, "APM processing failed with code: $result")
                     }
@@ -164,6 +206,18 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
             } catch (e: Exception) {
                 Log.e(TAG, "Error setting stream delay", e)
             }
+        }
+    }
+    
+    /**
+     * Reset synchronization counters - call when starting a new session
+     */
+    fun resetSynchronization() {
+        lock.withLock {
+            renderFrameCount = 0
+            captureFrameCount = 0
+            lastRenderTime = 0
+            Log.d(TAG, "Synchronization counters reset")
         }
     }
     

@@ -48,6 +48,12 @@ class MethodChannelFlutterWebrtcAec extends FlutterWebrtcAecPlatform {
   }
 
   @override
+  Future<bool> setCaptureEnabled(bool enabled) async {
+    final result = await methodChannel.invokeMethod<bool>('setCaptureEnabled', {'enabled': enabled});
+    return result ?? false;
+  }
+
+  @override
   Future<bool> playAudio(List<int> audioData) async {
     final result = await methodChannel.invokeMethod<bool>('playAudio', {'audioData': audioData});
     return result ?? false;

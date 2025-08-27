@@ -26,6 +26,13 @@ interface FullDuplexAudioClient {
     fun setAecEnabled(enabled: Boolean)
     
     /**
+     * Enable or disable microphone capture processing
+     * Playback will continue independently
+     * @param enabled true to enable capture, false to disable
+     */
+    fun setCaptureEnabled(enabled: Boolean)
+    
+    /**
      * Push playback PCM data (10ms frames)
      * This audio will be played and used as AEC reference
      * @param audioData PCM data (stereo or mono supported)

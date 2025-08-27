@@ -88,6 +88,9 @@ class FullDuplexAudioClientImpl(
                 return false
             }
             
+            // Reset synchronization counters for a fresh start
+            apmEngine.resetSynchronization()
+            
             // Initialize audio session
             if (!audioSession.initializeSession(audioManager)) {
                 Log.e(TAG, "Failed to initialize audio session")
@@ -174,6 +177,17 @@ class FullDuplexAudioClientImpl(
             Log.d(TAG, "AEC ${if (enabled) "enabled" else "disabled"}")
         } catch (e: Exception) {
             Log.e(TAG, "Error setting AEC enabled state", e)
+        }
+    }
+    
+    override fun setCaptureEnabled(enabled: Boolean) {
+        try {
+            if (::audioThreads.isInitialized) {
+                audioThreads.setCaptureEnabled(enabled)
+            }
+            Log.d(TAG, "Capture ${if (enabled) "enabled" else "disabled"}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting capture enabled", e)
         }
     }
     

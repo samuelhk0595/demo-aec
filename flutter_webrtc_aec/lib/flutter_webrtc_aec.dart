@@ -18,6 +18,12 @@ class FlutterWebrtcAec {
     return FlutterWebrtcAecPlatform.instance.setAecEnabled(enabled);
   }
 
+  /// Enable or disable capture processing (microphone recording)
+  /// Playback will continue for receiving audio from other sources
+  Future<bool> setCaptureEnabled(bool enabled) {
+    return FlutterWebrtcAecPlatform.instance.setCaptureEnabled(enabled);
+  }
+
   /// Play audio data (this will be used as reference for AEC)
   Future<bool> playAudio(List<int> audioData) {
     return FlutterWebrtcAecPlatform.instance.playAudio(audioData);

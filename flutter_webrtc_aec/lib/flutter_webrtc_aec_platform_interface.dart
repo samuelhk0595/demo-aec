@@ -36,6 +36,10 @@ abstract class FlutterWebrtcAecPlatform extends PlatformInterface {
     throw UnimplementedError('setAecEnabled() has not been implemented.');
   }
 
+  Future<bool> setCaptureEnabled(bool enabled) {
+    throw UnimplementedError('setCaptureEnabled() has not been implemented.');
+  }
+
   Future<bool> playAudio(List<int> audioData) {
     throw UnimplementedError('playAudio() has not been implemented.');
   }

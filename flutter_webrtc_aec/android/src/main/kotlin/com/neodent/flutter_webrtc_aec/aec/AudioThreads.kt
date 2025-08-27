@@ -22,6 +22,7 @@ class AudioThreads(
     }
     
     private val isRunning = AtomicBoolean(false)
+    private val isCaptureEnabled = AtomicBoolean(true)
     private var renderThread: Thread? = null
     private var captureThread: Thread? = null
     
@@ -45,6 +46,15 @@ class AudioThreads(
     fun setExternalRenderFeederActive(active: Boolean) {
         externalRenderFeederActive.set(active)
         Log.d(TAG, "External render feeder active=$active")
+    }
+    
+    /**
+     * Enable or disable capture processing
+     * @param enabled true to enable capture, false to disable
+     */
+    fun setCaptureEnabled(enabled: Boolean) {
+        isCaptureEnabled.set(enabled)
+        Log.d(TAG, "Capture enabled=$enabled")
     }
     
     /**
@@ -238,15 +248,19 @@ class AudioThreads(
                         }
                         
                         if (totalRead == frameSize) {
-                            // Process with AEC
-                            val processSuccess = apmEngine.processCaptureMono(inputBuffer, outputBuffer)
-                            
-                            // Send processed audio to callback
-                            captureCallback?.invoke(outputBuffer.copyOf())
-                            
-                            if (!processSuccess) {
-                                Log.w(TAG, "APM processing failed for capture frame")
+                            // Process with AEC only if capture is enabled
+                            if (isCaptureEnabled.get()) {
+                                val processSuccess = apmEngine.processCaptureMono(inputBuffer, outputBuffer)
+                                
+                                // Send processed audio to callback
+                                captureCallback?.invoke(outputBuffer.copyOf())
+                                
+                                if (!processSuccess) {
+                                    Log.w(TAG, "APM processing failed for capture frame")
+                                }
                             }
+                            // If capture is disabled, we still read from microphone to prevent buffer overflow
+                            // but we don't process or send the audio
                         }
                         
                     } catch (e: Exception) {

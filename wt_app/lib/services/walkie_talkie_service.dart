@@ -47,10 +47,16 @@ class WalkieTalkieService {
       onPlay: () => _log('🔊 Starting audio playback'),
       onStop: () => _log('🔇 Audio playback stopped'),
       onLog: _log,
-      onError: _logError,
+      onError: (error) {
+        _logError(error);
+        // If AEC consistently fails, fall back to raw microphone
+        if (error.contains('APM processing failed') || error.contains('render stream sync')) {
+          _log('AEC synchronization issues detected, consider falling back to raw microphone');
+        }
+      },
       onCaptureFrame: (audioData) {
         // Send the processed audio data to WebSocket
-        if (_connectionStatus == ConnectionStatus.connected) {
+        if (_connectionStatus == ConnectionStatus.connected && _useAecProcessedAudio) {
           _webSocketService.sendAudioData(Uint8List.fromList(audioData));
         }
       },
@@ -74,9 +80,16 @@ class WalkieTalkieService {
   Future<void> initialize() async {
     try {
       await _audioPlaybackService.initAudioEngine();
-      _log('Services initialized');
+      
+      // Check if AEC is properly initialized
+      // If AEC initialization fails, fall back to raw microphone
+      _useAecProcessedAudio = true; // We'll detect failures and adjust this
+      
+      _log('Services initialized with AEC processing enabled');
     } catch (e) {
       _logError('Error initializing services: $e');
+      _useAecProcessedAudio = false; // Fall back to raw microphone
+      _log('Falling back to raw microphone audio (no AEC)');
     }
   }
 
@@ -114,7 +127,23 @@ class WalkieTalkieService {
       return;
     }
 
-    await _microphoneService.startRecording();
+    if (_useAecProcessedAudio) {
+      // Enable AEC capture processing
+      try {
+        await _audioPlaybackService.setCaptureEnabled(true);
+        _log('🎤 Recording started (AEC-processed audio)');
+      } catch (e) {
+        _logError('Failed to enable AEC capture: $e');
+        // Fall back to raw microphone
+        _useAecProcessedAudio = false;
+        await _microphoneService.startRecording();
+        _log('🎤 Recording started (fallback to raw microphone)');
+      }
+    } else {
+      // Use raw microphone as fallback
+      await _microphoneService.startRecording();
+      _log('🎤 Recording started (raw microphone audio)');
+    }
   }
 
   Future<void> stopRecording() async {
@@ -122,13 +151,42 @@ class WalkieTalkieService {
   }
 
   Future<void> _stopRecording() async {
-    await _microphoneService.stopRecording();
-    await _audioPlaybackService.stopPlayback();
+    if (_useAecProcessedAudio) {
+      // For AEC, disable capture but keep playback running
+      try {
+        await _audioPlaybackService.setCaptureEnabled(false);
+        _log('🎤 Recording stopped (AEC playback continues for incoming audio)');
+      } catch (e) {
+        _logError('Error disabling AEC capture: $e');
+      }
+    } else {
+      // Stop raw microphone
+      await _microphoneService.stopRecording();
+      _log('🎤 Recording stopped (raw microphone)');
+    }
+    
+    // Note: We deliberately DON'T stop audioPlaybackService.stopPlayback()
+    // because we want to keep receiving and playing audio from other clients
   }
 
   void toggleMute() {
     _microphoneService.toggleMute();
     _log('Microphone ${_microphoneService.isMuted ? 'muted' : 'unmuted'}');
+  }
+
+  /// Switch between AEC-processed audio and raw microphone audio
+  void toggleAecMode() {
+    _useAecProcessedAudio = !_useAecProcessedAudio;
+    _log('Audio mode: ${_useAecProcessedAudio ? 'AEC-processed' : 'Raw microphone'}');
+    
+    // If switching to raw microphone while recording, start the microphone service
+    if (!_useAecProcessedAudio && _connectionStatus == ConnectionStatus.connected) {
+      _microphoneService.startRecording();
+    }
+    // If switching to AEC while using raw microphone, stop the microphone service
+    else if (_useAecProcessedAudio) {
+      _microphoneService.stopRecording();
+    }
   }
 
   void _onWebSocketConnected() {

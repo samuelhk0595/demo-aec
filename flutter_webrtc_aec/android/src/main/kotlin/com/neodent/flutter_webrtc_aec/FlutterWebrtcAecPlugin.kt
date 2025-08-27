@@ -45,6 +45,11 @@ class FlutterWebrtcAecPlugin: FlutterPlugin, MethodCallHandler {
                     val success = setAecEnabled(enabled)
                     result.success(success)
                 }
+                "setCaptureEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    val success = setCaptureEnabled(enabled)
+                    result.success(success)
+                }
                 "playAudio" -> {
                     val audioData = call.argument<IntArray>("audioData")
                     val success = playAudio(audioData)
@@ -128,6 +133,16 @@ class FlutterWebrtcAecPlugin: FlutterPlugin, MethodCallHandler {
             true
         } catch (e: Exception) {
             Log.e(TAG, "Error setting AEC enabled", e)
+            false
+        }
+    }
+
+    private fun setCaptureEnabled(enabled: Boolean): Boolean {
+        return try {
+            audioClient?.setCaptureEnabled(enabled)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting capture enabled", e)
             false
         }
     }
