@@ -29,6 +29,9 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
     private var renderFrameCount = 0L
     private var captureFrameCount = 0L
     private var lastRenderTime = 0L
+    private var lastDelayUpdateCaptureFrame = 0L
+    private var consecutiveLibErrors = 0
+    private var usingMobileAECM = true
     
     @Volatile
     private var isInitialized = false
@@ -41,18 +44,18 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
             try {
                 // Create APM with configuration from AEC.md recommendations
                 apm = Apm(
-                    false,  // aecExtendFilter
+                    true,   // aecExtendFilter (help robust echo paths)
                     true,   // speechIntelligibilityEnhance
                     true,   // delayAgnostic
                     false,  // beamforming
-                    false,  // nextGenerationAec (use AECM for mobile)
+                    false,  // nextGenerationAec
                     false,  // experimentalNs
                     false   // experimentalAgc
                 )
-                
-                // Configure AECM for mobile/speakerphone use
+                // Start with mobile AECM; can auto-switch to full AEC if needed
                 apm?.AECMSetSuppressionLevel(Apm.AECM_RoutingMode.Speakerphone)
                 apm?.AECM(true)
+                usingMobileAECM = true
                 
                 // Enable noise suppression with high level
                 apm?.NSSetLevel(Apm.NS_Level.High)
@@ -142,24 +145,31 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                 System.arraycopy(inputMono10ms, 0, captureBuffer, 0, frameSamples)
                 
                 // Only attempt AEC processing if synchronization is good
+                var skipped = false
                 val result = if (hasRecentRenderData && renderFrameCount > RENDER_BUFFER_FRAMES && !isRenderTooFast) {
+                    // Dynamic delay estimate (rough): time since last render; update every 50 capture frames
+                    if (captureFrameCount - lastDelayUpdateCaptureFrame >= 50) {
+                        val est = timeSinceLastRender.toInt().coerceIn(0, 300)
+                        try { apm?.SetStreamDelay(est) } catch (_: Exception) {}
+                        lastDelayUpdateCaptureFrame = captureFrameCount
+                    }
                     apm?.ProcessCaptureStream(captureBuffer, 0) ?: -1
                 } else {
-                    // Skip AEC processing if sync conditions are not met
+                    skipped = true
                     if (!hasRecentRenderData) {
                         if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC: no recent render data (${timeSinceLastRender}ms ago)")
+                            Log.d(TAG, "Skipping AEC(sync): no recent render data (${timeSinceLastRender}ms)")
                         }
                     } else if (isRenderTooFast) {
                         if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC: render too fast (ratio=${String.format("%.2f", frameRatio)}, render=$renderFrameCount, capture=$captureFrameCount)")
+                            Log.d(TAG, "Skipping AEC(sync): render too fast ratio=${String.format("%.2f", frameRatio)} r=$renderFrameCount c=$captureFrameCount")
                         }
                     } else {
                         if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC: waiting for render buffer (${renderFrameCount}/${RENDER_BUFFER_FRAMES})")
+                            Log.d(TAG, "Skipping AEC(sync): waiting render buffer r=$renderFrameCount/${RENDER_BUFFER_FRAMES}")
                         }
                     }
-                    -11 // Simulate sync issue to use fallback
+                    -11
                 }
                 
                 if (captureFrameCount % 200L == 0L) {
@@ -177,19 +187,30 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                 }
 
                 if (result == 0) {
+                    consecutiveLibErrors = 0
                     // Copy processed audio to output
                     System.arraycopy(captureBuffer, 0, outputMono10ms, 0, frameSamples)
                     true
                 } else {
-                    // APM processing failed, but continue with unprocessed audio
-                    // This can happen if render stream is not properly synchronized
-                    if (result == -11) {
-                        // Reduce log frequency for sync issues
-                        if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "APM processing failed (render stream sync issue): $result - frames: render=$renderFrameCount, capture=$captureFrameCount")
-                        }
+                    if (skipped) {
+                        // We intentionally skipped; minimal logging already done
                     } else {
-                        Log.w(TAG, "APM processing failed with code: $result")
+                        consecutiveLibErrors++
+                        if (captureFrameCount % 50 == 1L) {
+                            Log.w(TAG, "APM library returned error code: $result (consec=$consecutiveLibErrors) r=$renderFrameCount c=$captureFrameCount mode=${if (usingMobileAECM) "AECM" else "AEC"}")
+                        }
+                        // Attempt auto-switch from AECM to full AEC if persistent failures
+                        if (usingMobileAECM && consecutiveLibErrors == 200) {
+                            try {
+                                Log.w(TAG, "Switching from AECM to full AEC due to persistent errors")
+                                apm?.AECM(false)
+                                apm?.AEC(true)
+                                usingMobileAECM = false
+                                consecutiveLibErrors = 0
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed switching to full AEC", e)
+                            }
+                        }
                     }
                     // Fallback: copy input directly to output
                     System.arraycopy(inputMono10ms, 0, outputMono10ms, 0, frameSamples)

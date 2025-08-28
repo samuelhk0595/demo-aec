@@ -130,6 +130,11 @@ class FullDuplexAudioClientImpl(
         }
         
         try {
+            // Pre-fill APM with a few silent render frames so initial capture frames have reference
+            val preBufferFrames = 5
+            val silent = ShortArray(frameSamples)
+            repeat(preBufferFrames) { apmEngine.pushRenderMono(silent) }
+            Log.d(TAG, "Pre-buffered $preBufferFrames silent render frames before starting threads")
             // Start audio processing threads
             if (audioThreads.start()) {
                 isActive.set(true)

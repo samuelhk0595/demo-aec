@@ -1,6 +1,9 @@
 package com.neodent.flutter_webrtc_aec.aec
 
 import android.media.*
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import android.media.audiofx.AutomaticGainControl
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -23,6 +26,10 @@ class AudioSessionManager(
     private var audioSessionId: Int = AudioManager.AUDIO_SESSION_ID_GENERATE
     private var originalAudioMode: Int = AudioManager.MODE_NORMAL
     private var originalSpeakerphoneState: Boolean = false
+    // Hardware audio effects (we disable them to avoid double-processing with WebRTC APM)
+    private var hardwareAec: AcousticEchoCanceler? = null
+    private var hardwareNs: NoiseSuppressor? = null
+    private var hardwareAgc: AutomaticGainControl? = null
     
     // Audio format parameters
     private val frameSize = sampleRate / 100 // 10ms worth of samples
@@ -179,6 +186,10 @@ class AudioSessionManager(
             
             // Then start recording
             audioRecord?.startRecording()
+
+            // Obtain actual session ID (after creation) and disable hardware effects
+            audioSessionId = audioRecord?.audioSessionId ?: audioSessionId
+            disableHardwareEffects(audioSessionId)
             
             Log.d(TAG, "Audio playback and recording started")
             return true
@@ -250,6 +261,7 @@ class AudioSessionManager(
         stopAudio()
         releaseAudioRecord()
         releaseAudioTrack()
+    releaseHardwareEffects()
         isSessionActive.set(false)
         Log.d(TAG, "Audio session released")
     }
@@ -286,6 +298,38 @@ class AudioSessionManager(
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing AudioTrack", e)
         }
+    }
+
+    private fun disableHardwareEffects(sessionId: Int) {
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                hardwareAec = AcousticEchoCanceler.create(sessionId)
+                hardwareAec?.enabled = false
+                Log.d(TAG, "Hardware AEC found and disabled")
+            } else {
+                Log.d(TAG, "Hardware AEC not available")
+            }
+        } catch (e: Exception) { Log.w(TAG, "Failed to manage hardware AEC", e) }
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                hardwareNs = NoiseSuppressor.create(sessionId)
+                hardwareNs?.enabled = false
+                Log.d(TAG, "Hardware NoiseSuppressor found and disabled")
+            }
+        } catch (e: Exception) { Log.w(TAG, "Failed to manage hardware NS", e) }
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                hardwareAgc = AutomaticGainControl.create(sessionId)
+                hardwareAgc?.enabled = false
+                Log.d(TAG, "Hardware AGC found and disabled")
+            }
+        } catch (e: Exception) { Log.w(TAG, "Failed to manage hardware AGC", e) }
+    }
+
+    private fun releaseHardwareEffects() {
+        try { hardwareAec?.release(); hardwareAec = null } catch (_: Exception) {}
+        try { hardwareNs?.release(); hardwareNs = null } catch (_: Exception) {}
+        try { hardwareAgc?.release(); hardwareAgc = null } catch (_: Exception) {}
     }
     
     /**

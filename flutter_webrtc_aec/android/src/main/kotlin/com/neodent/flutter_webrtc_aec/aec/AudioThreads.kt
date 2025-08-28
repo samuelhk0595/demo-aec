@@ -36,6 +36,11 @@ class AudioThreads(
     private val frameSize = audioSession.getFrameSize()
     private val stereoFrameSize = frameSize * 2
     private val tempStereoBuffer = ShortArray(stereoFrameSize)
+    // Simple counters for diagnostics
+    @Volatile private var renderFramesFed = 0L
+    @Volatile private var captureFramesObserved = 0L
+    private var lastRenderLogTime = 0L
+    private var lastCaptureLogTime = 0L
 
     // When true, another component (e.g. decoded file playback thread) is already
     // pushing perfectly timed 10ms render frames into the APM. In that case we must
@@ -55,6 +60,16 @@ class AudioThreads(
     fun setCaptureEnabled(enabled: Boolean) {
         isCaptureEnabled.set(enabled)
         Log.d(TAG, "Capture enabled=$enabled")
+        if (enabled) {
+            // Reset counters so AEC doesn't see huge historical render lead
+            renderFramesFed = 0
+            captureFramesObserved = 0
+            apmEngine.resetSynchronization()
+            // Provide fresh small render history (silent) so first capture frames can process immediately
+            val silent = ShortArray(frameSize)
+            repeat(5) { apmEngine.pushRenderMono(silent) }
+            Log.d(TAG, "Capture enable sync reset applied")
+        }
     }
     
     /**
@@ -171,15 +186,22 @@ class AudioThreads(
             try {
                 while (isRunning.get()) {
                     try {
+                        // If capture disabled, avoid advancing render stream to prevent large ratio gaps.
+                        if (!isCaptureEnabled.get()) {
+                            Thread.sleep(10)
+                            continue
+                        }
                         // Try to get audio data from queue (non-blocking with timeout)
                         val audioData = playbackQueue.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS)
                         
+                        // Snapshot capture count from ApmEngine perspective is not directly accessible;
+                        // we'll approximate using internal counters updated by capture thread via callback hook later if needed.
                         if (audioData != null) {
                             // Convert to mono for AEC reference
                             val monoAudio = convertToMono(audioData, monoBuffer)
-                            // Feed mono ref ONLY if there is no dedicated external feeder
                             if (!externalRenderFeederActive.get()) {
                                 apmEngine.pushRenderMono(monoAudio)
+                                renderFramesFed++
                             }
                             // Ensure playback buffer matches AudioTrack channel config
                             val playbackData = if (audioData.size == frameSize && stereoFrameSize != frameSize) {
@@ -199,9 +221,17 @@ class AudioThreads(
                                 Log.w(TAG, "Failed to write playback data")
                             }
                         } else {
-                            // No queued audio. Feed silence to maintain timing (safe even if external feeder also active;
-                            // duplication of silent frame is benign, and ensures cadence during pauses of external feeder).
-                            apmEngine.pushRenderMono(silenceBuffer)
+                            if (!externalRenderFeederActive.get()) {
+                                apmEngine.pushRenderMono(silenceBuffer)
+                                renderFramesFed++
+                            }
+                        }
+
+                        val nowMs = System.currentTimeMillis()
+                        if (nowMs - lastRenderLogTime > 5000) {
+                            val ratio = if (captureFramesObserved > 0) renderFramesFed.toDouble() / captureFramesObserved else 0.0
+                            Log.d(TAG, "Render pacing diag: render=${renderFramesFed} capture=${captureFramesObserved} ratio=${"%.2f".format(ratio)} queue=${playbackQueue.size}")
+                            lastRenderLogTime = nowMs
                         }
 
                         // Precise pacing: aim for one iteration per 10ms without cumulative drift
@@ -259,24 +289,21 @@ class AudioThreads(
                                 break
                             }
                         }
-                        // Attempt pacing alignment with render to reduce jitter in AEC delay estimation
-                        nextDeadline += nanosPerFrame
-                        val now = System.nanoTime()
-                        val sleepNanos = nextDeadline - now
-                        if (sleepNanos > 0) {
-                            Thread.sleep(sleepNanos / 1_000_000L, (sleepNanos % 1_000_000L).toInt())
-                        } else if (sleepNanos < -20_000_000L) { // if we are >20ms late, resync clock
-                            nextDeadline = now
+                        // (Removed additional pacing sleep; rely on blocking read timing to naturally pace capture)
+                        val nowMs = System.currentTimeMillis()
+                        if (nowMs - lastCaptureLogTime > 5000) {
+                            val ratio = if (captureFramesObserved > 0) renderFramesFed.toDouble() / captureFramesObserved else 0.0
+                            Log.d(TAG, "Capture pacing diag: render=${renderFramesFed} capture=${captureFramesObserved} ratio=${"%.2f".format(ratio)}")
+                            lastCaptureLogTime = nowMs
                         }
                         
                         if (totalRead == frameSize) {
                             // Process with AEC only if capture is enabled
                             if (isCaptureEnabled.get()) {
                                 val processSuccess = apmEngine.processCaptureMono(inputBuffer, outputBuffer)
-                                
+                                captureFramesObserved++
                                 // Send processed audio to callback
                                 captureCallback?.invoke(outputBuffer.copyOf())
-                                
                                 if (!processSuccess) {
                                     Log.w(TAG, "APM processing failed for capture frame")
                                 }
@@ -295,6 +322,7 @@ class AudioThreads(
             }
         }
     }
+
     
     /**
      * Convert stereo or mono audio to mono for AEC reference
