@@ -221,6 +221,24 @@ class AudioThreads(
                                 Log.w(TAG, "Failed to write playback data")
                             }
                         } else {
+                            // Maintain device playback pacing with silence
+                            val playbackSilence: ShortArray = if (audioSession.isStereoPlayback()) {
+                                var i = 0
+                                while (i < tempStereoBuffer.size) {
+                                    tempStereoBuffer[i++] = 0
+                                    tempStereoBuffer[i++] = 0
+                                }
+                                tempStereoBuffer
+                            } else {
+                                // mono
+                                for (i in 0 until monoBuffer.size) monoBuffer[i] = 0
+                                monoBuffer
+                            }
+                            val bytesWritten = audioSession.writePlaybackData(playbackSilence)
+                            if (bytesWritten < 0) {
+                                Log.w(TAG, "Failed to write silence to playback")
+                            }
+
                             if (!externalRenderFeederActive.get()) {
                                 apmEngine.pushRenderMono(silenceBuffer)
                                 renderFramesFed++

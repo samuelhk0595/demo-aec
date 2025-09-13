@@ -15,6 +15,7 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
         private const val TAG = "ApmEngine"
         private const val FRAME_DURATION_MS = 10
         private const val RENDER_BUFFER_FRAMES = 5 // Buffer 5 frames to ensure sync
+        private const val MAX_REVERSE_QUEUE = 50   // Max reverse frames to queue before dropping oldest
     }
     
     private var apm: Apm? = null
@@ -24,6 +25,8 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
     // Buffers for audio processing
     private val renderBuffer = ShortArray(frameSamples)
     private val captureBuffer = ShortArray(frameSamples)
+    // Reverse (render) frame queue to enforce ordering: render before capture
+    private val reverseQueue: ArrayDeque<ShortArray> = ArrayDeque()
     
     // Render stream tracking for better synchronization
     private var renderFrameCount = 0L
@@ -91,24 +94,15 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
         
         lock.withLock {
             try {
-                System.arraycopy(audioMono10ms, 0, renderBuffer, 0, frameSamples)
-                val result = apm?.ProcessRenderStream(renderBuffer, 0) ?: -1
-                if (renderFrameCount % 200L == 0L) {
-                    var peak = 0
-                    for (s in renderBuffer) {
-                        val a = kotlin.math.abs(s.toInt())
-                        if (a > peak) peak = a
-                    }
-                    Log.d(TAG, "Render frame=${renderFrameCount} peak=$peak")
+                // Enqueue a copy of the reverse frame; process during capture to guarantee ordering
+                val frameCopy = ShortArray(frameSamples)
+                System.arraycopy(audioMono10ms, 0, frameCopy, 0, frameSamples)
+                if (reverseQueue.size >= MAX_REVERSE_QUEUE) {
+                    // Drop oldest to avoid unbounded growth; favor latest frames
+                    reverseQueue.removeFirst()
                 }
-                
-                // Track render stream timing
-                renderFrameCount++
+                reverseQueue.addLast(frameCopy)
                 lastRenderTime = System.currentTimeMillis()
-                
-                if (result != 0) {
-                    Log.d(TAG, "Render stream processing result: $result")
-                }
             } catch (e: Exception) {
                 Log.e(TAG, "Error processing render stream", e)
             }
@@ -131,46 +125,38 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
         
         return lock.withLock {
             try {
-                // Check if we have recent render data for proper AEC synchronization
-                val timeSinceLastRender = System.currentTimeMillis() - lastRenderTime
-                val hasRecentRenderData = timeSinceLastRender < 100 // 100ms tolerance
-                
-                // Check frame ratio to detect if render is being fed too fast
-                val frameRatio = if (captureFrameCount > 0) renderFrameCount.toDouble() / captureFrameCount else 0.0
-                val isRenderTooFast = frameRatio > 1.5 // Render is 50% faster than capture
-                
                 captureFrameCount++
                 
                 // Copy input to internal buffer
                 System.arraycopy(inputMono10ms, 0, captureBuffer, 0, frameSamples)
                 
-                // Only attempt AEC processing if synchronization is good
-                var skipped = false
-                val result = if (hasRecentRenderData && renderFrameCount > RENDER_BUFFER_FRAMES && !isRenderTooFast) {
-                    // Dynamic delay estimate (rough): time since last render; update every 50 capture frames
-                    if (captureFrameCount - lastDelayUpdateCaptureFrame >= 50) {
-                        val est = timeSinceLastRender.toInt().coerceIn(0, 300)
-                        try { apm?.SetStreamDelay(est) } catch (_: Exception) {}
-                        lastDelayUpdateCaptureFrame = captureFrameCount
+                // Drain any queued reverse frames first to guarantee correct ordering
+                var drained = 0
+                while (reverseQueue.isNotEmpty()) {
+                    val rev = reverseQueue.removeFirst()
+                    val rr = apm?.ProcessRenderStream(rev, 0) ?: -1
+                    renderFrameCount++
+                    if (rr != 0 && renderFrameCount % 100L == 0L) {
+                        Log.d(TAG, "Render stream processing non-zero: $rr (drain)")
                     }
-                    apm?.ProcessCaptureStream(captureBuffer, 0) ?: -1
-                } else {
-                    skipped = true
-                    if (!hasRecentRenderData) {
-                        if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC(sync): no recent render data (${timeSinceLastRender}ms)")
-                        }
-                    } else if (isRenderTooFast) {
-                        if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC(sync): render too fast ratio=${String.format("%.2f", frameRatio)} r=$renderFrameCount c=$captureFrameCount")
-                        }
-                    } else {
-                        if (captureFrameCount % 100 == 1L) {
-                            Log.d(TAG, "Skipping AEC(sync): waiting render buffer r=$renderFrameCount/${RENDER_BUFFER_FRAMES}")
-                        }
-                    }
-                    -11
+                    drained++
                 }
+
+                // If no reverse frames were available recently, prefill minimal silence to keep AEC stable
+                val silent = ShortArray(frameSamples)
+                if (renderFrameCount < RENDER_BUFFER_FRAMES) {
+                    repeat(RENDER_BUFFER_FRAMES - renderFrameCount.toInt()) {
+                        apm?.ProcessRenderStream(silent, 0)
+                        renderFrameCount++
+                    }
+                } else if (drained == 0) {
+                    // Maintain approximate 1:1 cadence between reverse and capture streams
+                    apm?.ProcessRenderStream(silent, 0)
+                    renderFrameCount++
+                }
+
+                // Do NOT twiddle SetStreamDelay dynamically here; delay-agnostic AEC is enabled
+                val result = apm?.ProcessCaptureStream(captureBuffer, 0) ?: -1
                 
                 if (captureFrameCount % 200L == 0L) {
                     var peakIn = 0
@@ -183,7 +169,7 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                         val a = kotlin.math.abs(s.toInt())
                         if (a > peakOut) peakOut = a
                     }
-                    Log.d(TAG, "Capture frame=${captureFrameCount} peakIn=$peakIn peakOut=$peakOut ratio=${String.format("%.2f", if (captureFrameCount>0) renderFrameCount.toDouble()/captureFrameCount else 0.0)} recentRender=${hasRecentRenderData} renderTooFast=$isRenderTooFast")
+                    Log.d(TAG, "Capture frame=${captureFrameCount} peakIn=$peakIn peakOut=$peakOut ratio=${String.format("%.2f", if (captureFrameCount>0) renderFrameCount.toDouble()/captureFrameCount else 0.0)} drained=$drained")
                 }
 
                 if (result == 0) {
@@ -192,24 +178,20 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
                     System.arraycopy(captureBuffer, 0, outputMono10ms, 0, frameSamples)
                     true
                 } else {
-                    if (skipped) {
-                        // We intentionally skipped; minimal logging already done
-                    } else {
-                        consecutiveLibErrors++
-                        if (captureFrameCount % 50 == 1L) {
-                            Log.w(TAG, "APM library returned error code: $result (consec=$consecutiveLibErrors) r=$renderFrameCount c=$captureFrameCount mode=${if (usingMobileAECM) "AECM" else "AEC"}")
-                        }
-                        // Attempt auto-switch from AECM to full AEC if persistent failures
-                        if (usingMobileAECM && consecutiveLibErrors == 200) {
-                            try {
-                                Log.w(TAG, "Switching from AECM to full AEC due to persistent errors")
-                                apm?.AECM(false)
-                                apm?.AEC(true)
-                                usingMobileAECM = false
-                                consecutiveLibErrors = 0
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed switching to full AEC", e)
-                            }
+                    consecutiveLibErrors++
+                    if (captureFrameCount % 50 == 1L) {
+                        Log.w(TAG, "APM library returned error code: $result (consec=$consecutiveLibErrors) r=$renderFrameCount c=$captureFrameCount mode=${if (usingMobileAECM) "AECM" else "AEC"}")
+                    }
+                    // Attempt auto-switch from AECM to full AEC if persistent failures
+                    if (usingMobileAECM && consecutiveLibErrors == 200) {
+                        try {
+                            Log.w(TAG, "Switching from AECM to full AEC due to persistent errors")
+                            apm?.AECM(false)
+                            apm?.AEC(true)
+                            usingMobileAECM = false
+                            consecutiveLibErrors = 0
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed switching to full AEC", e)
                         }
                     }
                     // Fallback: copy input directly to output
@@ -260,6 +242,7 @@ class ApmEngine(private val sampleRateHz: Int = 16000) {
             renderFrameCount = 0
             captureFrameCount = 0
             lastRenderTime = 0
+            reverseQueue.clear()
             Log.d(TAG, "Synchronization counters reset")
         }
     }
