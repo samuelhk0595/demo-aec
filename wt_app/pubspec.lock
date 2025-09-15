@@ -78,6 +78,13 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  flutter_aec:
+    dependency: "direct main"
+    description:
+      path: "../flutter_aec"
+      relative: true
+    source: path
+    version: "0.0.1"
   flutter_lints:
     dependency: "direct dev"
     description:
@@ -414,5 +421,5 @@ packages:
     source: hosted
     version: "2.4.0"
 sdks:
-  dart: ">=3.7.0-0 <4.0.0"
+  dart: ">=3.8.1 <4.0.0"
   flutter: ">=3.24.0"

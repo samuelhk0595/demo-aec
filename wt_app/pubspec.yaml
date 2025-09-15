@@ -44,6 +44,10 @@ dependencies:
   
   # Permissions
   permission_handler: ^11.3.1
+  
+  # AEC (Acoustic Echo Cancellation) plugin
+  flutter_aec:
+    path: ../flutter_aec
 
 dev_dependencies:
   flutter_test:

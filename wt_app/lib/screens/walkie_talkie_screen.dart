@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_aec/flutter_aec.dart';
 import '../services/walkie_talkie_service.dart';
 
 class WalkieTalkieScreen extends StatefulWidget {
@@ -336,6 +337,45 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
                     fontWeight: FontWeight.bold,
                   ),
                 ),
+              ],
+            ),
+          ),
+
+          // AEC Status indicator
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: Colors.blue.withOpacity(0.1),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.auto_fix_high,
+                  color: FlutterAec.instance.isInitialized ? Colors.green : Colors.grey,
+                  size: 16,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'AEC: ${FlutterAec.instance.isInitialized ? "Active" : "Inactive"} | NS: Enabled',
+                  style: TextStyle(
+                    color: FlutterAec.instance.isInitialized ? Colors.green : Colors.grey,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const Spacer(),
+                if (FlutterAec.instance.isInitialized) ...[
+                  Icon(
+                    Icons.mic,
+                    color: FlutterAec.instance.isCaptureStarted ? Colors.red : Colors.grey,
+                    size: 14,
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                    Icons.speaker,
+                    color: FlutterAec.instance.isPlaybackStarted ? Colors.blue : Colors.grey,
+                    size: 14,
+                  ),
+                ],
               ],
             ),
           ),

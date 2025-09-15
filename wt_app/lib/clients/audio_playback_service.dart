@@ -3,12 +3,15 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:realtime_audio/realtime_audio.dart';
+import 'package:flutter_aec/flutter_aec.dart';
 
 class AudioPlaybackService {
   final List<int> _audioBuffer = [];
   RealtimeAudio? _audioEngine;
   List<StreamSubscription<dynamic>>? _audioEngineSubscriptions;
   Timer? _flushTimer;
+  
+  final _aec = FlutterAec.instance;
 
   bool _isPlaying = false;
   bool get isPlaying => _isPlaying;
@@ -68,6 +71,28 @@ class AudioPlaybackService {
     }
   }
 
+  Future<bool> initializeAecPlayback() async {
+    try {
+      if (!_aec.isInitialized) {
+        onError?.call('AEC not initialized. Initialize it in MicrophoneService first.');
+        return false;
+      }
+
+      // Start AEC native playback
+      final success = await _aec.startNativePlayback();
+      if (success) {
+        onLog?.call('AEC native playback started');
+        return true;
+      } else {
+        onError?.call('Failed to start AEC native playback');
+        return false;
+      }
+    } catch (e) {
+      onError?.call('Error initializing AEC playback: $e');
+      return false;
+    }
+  }
+
   void _flushRemainingBuffer() {
     if (_audioEngine == null || _audioBuffer.isEmpty) return;
 
@@ -92,6 +117,10 @@ class AudioPlaybackService {
     if (_audioEngine == null) return;
 
     try {
+      // IMPORTANT: Feed incoming audio to AEC as far-end reference
+      // This must be done BEFORE or simultaneously with playback for optimal echo cancellation
+      _feedToAecFarEnd(audioData);
+
       _audioBuffer.addAll(audioData);
       onLog?.call(
           '⬇️ Buffering audio data: ${audioData.length} bytes (total: ${_audioBuffer.length})');
@@ -108,6 +137,36 @@ class AudioPlaybackService {
       _playBufferedAudioIfNeeded();
     } catch (e) {
       onError?.call('Error playing audio: $e');
+    }
+  }
+
+  void _feedToAecFarEnd(Uint8List audioData) {
+    if (!_aec.isInitialized || !_aec.isPlaybackStarted) {
+      return;
+    }
+
+    try {
+      // The AEC expects frames of exactly the configured size
+      // Our config uses 20ms frames at 16kHz = 320 samples = 640 bytes
+      const expectedFrameSize = 640; // 20ms * 16000 Hz * 2 bytes per sample
+      
+      // Split the audio data into AEC frame-sized chunks
+      for (int i = 0; i < audioData.length; i += expectedFrameSize) {
+        final endIndex = (i + expectedFrameSize > audioData.length) 
+            ? audioData.length 
+            : i + expectedFrameSize;
+        
+        if (endIndex - i == expectedFrameSize) {
+          final frameData = audioData.sublist(i, endIndex);
+          _aec.bufferFarend(frameData);
+          onLog?.call('Fed ${frameData.length} bytes to AEC far-end');
+        } else {
+          // Handle partial frame at the end - pad with zeros or skip
+          onLog?.call('Skipping partial frame: ${endIndex - i} bytes (expected: $expectedFrameSize)');
+        }
+      }
+    } catch (e) {
+      onError?.call('Error feeding audio to AEC far-end: $e');
     }
   }
 
@@ -150,6 +209,13 @@ class AudioPlaybackService {
       _isPlaying = false;
       _playbackStateController.add(false);
       onStop?.call();
+      
+      // Stop AEC native playback
+      if (_aec.isInitialized && _aec.isPlaybackStarted) {
+        await _aec.stopNativePlayback();
+        onLog?.call('AEC native playback stopped');
+      }
+      
       onLog?.call('Audio playback stopped');
     } catch (e) {
       onError?.call('Error stopping audio: $e');

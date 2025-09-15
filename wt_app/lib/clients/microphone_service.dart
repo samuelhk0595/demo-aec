@@ -1,13 +1,13 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:record/record.dart';
+import 'package:flutter_aec/flutter_aec.dart';
 
 class MicrophoneService {
   bool _isMuted = false;
   bool _isRecording = false;
-  final _audioRecorder = AudioRecorder();
-  StreamSubscription<Uint8List>? _audioStreamSubscription;
+  final _aec = FlutterAec.instance;
+  StreamSubscription<Uint8List>? _aecFrameSubscription;
 
   final StreamController<Uint8List> _audioDataController =
       StreamController<Uint8List>.broadcast();
@@ -27,9 +27,38 @@ class MicrophoneService {
 
   Future<bool> requestPermissions() async {
     try {
-      return await _audioRecorder.hasPermission();
+      // The AEC plugin will handle permission requests internally
+      return true;
     } catch (e) {
       onError?.call('Error requesting microphone permissions: $e');
+      return false;
+    }
+  }
+
+  Future<bool> initializeAec() async {
+    try {
+      if (_aec.isInitialized) {
+        return true;
+      }
+
+      const config = AecConfig(
+        sampleRate: 16000,
+        frameMs: 20,
+        echoMode: 1,        // Default echo cancellation mode
+        cngMode: false,     // Disable comfort noise generation for walkie-talkie
+        enableNs: false,     // Enable noise suppression
+      );
+
+      final success = await _aec.initialize(config);
+      if (success) {
+        onLog?.call('AEC Engine initialized successfully');
+        return true;  
+      } else {
+        onError?.call('Failed to initialize AEC Engine');
+        return false;
+      }
+    } catch (e) {
+      onError?.call('Error initializing AEC: $e');
       return false;
     }
   }
@@ -38,38 +67,39 @@ class MicrophoneService {
     if (_isRecording) return;
     
     try {
-      final hasPermission = await requestPermissions();
-      if (!hasPermission) {
-        onError?.call('Microphone permission denied');
+      // Initialize AEC if not already done
+      final aecReady = await initializeAec();
+      if (!aecReady) {
+        onError?.call('AEC initialization failed');
         return;
       }
 
-      const config = RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-        bitRate: 128000,
-      );
+      // Start AEC native capture
+      final success = await _aec.startNativeCapture();
+      if (!success) {
+        onError?.call('Failed to start AEC native capture');
+        return;
+      }
 
-      final audioStream = await _audioRecorder.startStream(config);
       _isRecording = true;
 
-      _audioStreamSubscription = audioStream.listen(
-        (data) => _onAudioData(data),
+      // Subscribe to processed frames from AEC
+      _aecFrameSubscription = _aec.processedNearStream.listen(
+        (frameData) => _onAudioData(frameData),
         onError: (error) {
-          onError?.call('Microphone Stream Error: $error');
+          onError?.call('AEC Frame Stream Error: $error');
           _stopRecording();
         },
         onDone: () {
-          onLog?.call('Microphone stream finished.');
+          onLog?.call('AEC processed frame stream finished.');
           _isRecording = false;
         },
         cancelOnError: true,
       );
       
-      onLog?.call('Started microphone recording');
+      onLog?.call('Started AEC-processed microphone recording');
     } catch (e) {
-      onError?.call('Error starting microphone: $e');
+      onError?.call('Error starting AEC microphone: $e');
       _isRecording = false;
     }
   }
@@ -77,7 +107,7 @@ class MicrophoneService {
   void _onAudioData(Uint8List data) {
     if (_isRecording && !_isMuted) {
       _audioDataController.add(data);
-      onLog?.call('⬆️ Sending microphone data: ${data.length} bytes');
+      onLog?.call('⬆️ Sending AEC-processed audio: ${data.length} bytes');
     } else if (_isMuted) {
       // Send silence when muted
       final silentData = Uint8List(data.length);
@@ -100,18 +130,18 @@ class MicrophoneService {
 
   Future<void> _stopRecording() async {
     if (_isRecording) {
-      await _audioRecorder.stop();
+      await _aec.stopNativeCapture();
       _isRecording = false;
-      onLog?.call('Microphone recording stopped');
+      onLog?.call('AEC microphone recording stopped');
     }
     
-    await _audioStreamSubscription?.cancel();
-    _audioStreamSubscription = null;
+    await _aecFrameSubscription?.cancel();
+    _aecFrameSubscription = null;
   }
 
-  void dispose() {
-    _stopRecording();
-    _audioRecorder.dispose();
+  void dispose() async {
+    await _stopRecording();
     _audioDataController.close();
+    // Note: We don't dispose the AEC here as it might be shared with other services
   }
 }

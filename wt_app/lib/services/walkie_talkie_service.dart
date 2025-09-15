@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:flutter_aec/flutter_aec.dart';
 import '../clients/microphone_service.dart';
 import '../clients/audio_playback_service.dart';
 import 'websocket_service.dart';
@@ -65,7 +66,11 @@ class WalkieTalkieService {
   Future<void> initialize() async {
     try {
       await _audioPlaybackService.initAudioEngine();
-      _log('Services initialized');
+      
+      // Initialize AEC through microphone service
+      await _microphoneService.initializeAec();
+      
+      _log('Services initialized with AEC support');
     } catch (e) {
       _logError('Error initializing services: $e');
     }
@@ -105,7 +110,17 @@ class WalkieTalkieService {
       return;
     }
 
-    await _microphoneService.startRecording();
+    try {
+      // Initialize AEC playback for far-end reference
+      await _audioPlaybackService.initializeAecPlayback();
+      
+      // Start AEC-enabled recording
+      await _microphoneService.startRecording();
+      
+      _log('Recording started with AEC enabled');
+    } catch (e) {
+      _logError('Error starting recording: $e');
+    }
   }
 
   Future<void> stopRecording() async {
@@ -140,7 +155,10 @@ class WalkieTalkieService {
   }
 
   void _onWebSocketAudioData(Uint8List audioData) {
+    // Feed incoming audio to playback service
+    // The AudioPlaybackService will automatically feed this to AEC as far-end reference
     _audioPlaybackService.playAudioData(audioData);
+    _log('⬇️ Received and processed audio with AEC: ${audioData.length} bytes');
   }
 
   void _updateConnectionStatus(ConnectionStatus status) {
@@ -161,6 +179,14 @@ class WalkieTalkieService {
     _microphoneService.dispose();
     _audioPlaybackService.dispose();
     _webSocketService.dispose();
+    
+    // Dispose AEC engine
+    try {
+      FlutterAec.instance.dispose();
+    } catch (e) {
+      _logError('Error disposing AEC: $e');
+    }
+    
     _connectionStatusController.close();
     _logController.close();
   }
