@@ -38,9 +38,8 @@ dependencies:
   # WebSocket client
   web_socket_channel: ^2.4.0
   
-  # Audio recording and playback
+  # Audio recording - using AEC native playback instead of realtime_audio
   record: ^6.1.1
-  realtime_audio: ^0.0.10
   
   # Permissions
   permission_handler: ^11.3.1

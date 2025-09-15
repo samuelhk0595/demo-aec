@@ -36,70 +36,89 @@ class MicrophoneService {
   }
 
   Future<bool> initializeAec() async {
+    print('[MicrophoneService] initializeAec() called');
     try {
       if (_aec.isInitialized) {
+        print('[MicrophoneService] AEC already initialized');
         return true;
       }
 
-      const config = AecConfig(
+      final config = AecConfig(
         sampleRate: 16000,
-        frameMs: 20,
+        frameMs: 10,
         echoMode: 3,        // Default echo cancellation mode
         cngMode: false,     // Disable comfort noise generation for walkie-talkie
         enableNs: true,     // Enable noise suppression
       );
 
+      print('[MicrophoneService] Calling AEC initialize with config...');
       final success = await _aec.initialize(config);
       if (success) {
         onLog?.call('AEC Engine initialized successfully');
-        return true;  
+        print('[MicrophoneService] AEC initialization successful');
+        // No need to set external playback delay when using native playback
+        print('[MicrophoneService] Using native playback - no external delay needed');
+        return true;
       } else {
         onError?.call('Failed to initialize AEC Engine');
+        print('[MicrophoneService] AEC initialization failed');
         return false;
       }
     } catch (e) {
       onError?.call('Error initializing AEC: $e');
+      print('[MicrophoneService] Exception in initializeAec: $e');
       return false;
     }
-  }
-
-  Future<void> startRecording() async {
-    if (_isRecording) return;
+  }  Future<void> startRecording() async {
+    print('[MicrophoneService] startRecording() called');
+    if (_isRecording) {
+      print('[MicrophoneService] Already recording, skipping');
+      return;
+    }
     
     try {
       // Initialize AEC if not already done
+      print('[MicrophoneService] Initializing AEC...');
       final aecReady = await initializeAec();
       if (!aecReady) {
         onError?.call('AEC initialization failed');
+        print('[MicrophoneService] AEC initialization failed, aborting');
         return;
       }
 
       // Start AEC native capture
+      print('[MicrophoneService] Starting AEC native capture...');
       final success = await _aec.startNativeCapture();
       if (!success) {
         onError?.call('Failed to start AEC native capture');
+        print('[MicrophoneService] Failed to start AEC native capture');
         return;
       }
 
       _isRecording = true;
+      print('[MicrophoneService] Setting up AEC frame subscription...');
 
       // Subscribe to processed frames from AEC
       _aecFrameSubscription = _aec.processedNearStream.listen(
         (frameData) => _onAudioData(frameData),
         onError: (error) {
           onError?.call('AEC Frame Stream Error: $error');
+          print('[MicrophoneService] AEC Frame Stream Error: $error');
           _stopRecording();
         },
         onDone: () {
           onLog?.call('AEC processed frame stream finished.');
+          print('[MicrophoneService] AEC processed frame stream finished');
           _isRecording = false;
         },
         cancelOnError: true,
       );
       
       onLog?.call('Started AEC-processed microphone recording');
+      print('[MicrophoneService] AEC microphone recording started successfully');
     } catch (e) {
       onError?.call('Error starting AEC microphone: $e');
+      print('[MicrophoneService] Exception in startRecording: $e');
       _isRecording = false;
     }
   }

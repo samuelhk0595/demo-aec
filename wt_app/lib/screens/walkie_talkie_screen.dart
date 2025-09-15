@@ -174,6 +174,8 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
     if (_isContinuousMode) {
       // Exit continuous mode when tapped
       await _exitContinuousMode();
+    }else{
+      await _enterContinuousMode();
     }
   }
 
@@ -508,12 +510,12 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
                         offset: Offset(0, _buttonOffsetAnimation.value),
                         child: GestureDetector(
                           onTap: _handleTap,
-                          onPanStart: _handlePanStart,
-                          onPanUpdate: _handlePanUpdate,
-                          onPanEnd: _handlePanEnd,
-                          onLongPress: () {
-                            debugPrint('Long press detected');
-                          },
+                          // onPanStart: _handlePanStart,
+                          // onPanUpdate: _handlePanUpdate,
+                          // onPanEnd: _handlePanEnd,
+                          // onLongPress: () {
+                          //   debugPrint('Long press detected');
+                          // },
                           child: Container(
                             width: 120,
                             height: 120,
