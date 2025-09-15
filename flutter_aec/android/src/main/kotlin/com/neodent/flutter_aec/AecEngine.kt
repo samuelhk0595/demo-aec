@@ -25,11 +25,14 @@ class AecEngine {
         private const val DEFAULT_CHANNEL_OUT_CONFIG = AudioFormat.CHANNEL_OUT_MONO
         private const val DEFAULT_AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val DEFAULT_FRAME_MS = 20
+        // Fallback playback delay guess (ms) when using external playback pipeline
+        private const val DEFAULT_EXTERNAL_PLAY_DELAY_MS = 60
     }
 
     private var sampleRate = DEFAULT_SAMPLE_RATE
     private var frameMs = DEFAULT_FRAME_MS
-    private var framesPerBuffer = 0
+    private var framesPerBuffer = 0 // near-end processing frame (will be coerced to 10ms for AECM)
+    private var aecmFrameSamples = 0 // 80 or 160 depending on sample rate (AECM constraint)
     private var enableNs = true
     private var echoMode = 3
     private var cngMode = false
@@ -47,6 +50,7 @@ class AecEngine {
 
     private var recordDelayMs = 0
     private var playDelayMs = 0
+    private var externalPlaybackDelayMs: Int? = null
 
     private val farEndQueue = ConcurrentLinkedQueue<ShortArray>()
     private val processedFrameQueue = ConcurrentLinkedQueue<ByteArray>()
@@ -61,8 +65,22 @@ class AecEngine {
         enableNs: Boolean = true
     ): Boolean {
         this.sampleRate = sampleRate
-        this.frameMs = frameMs
-        this.framesPerBuffer = sampleRate * frameMs / 1000
+        // AECM only supports 80 or 160 sample frames (i.e. 10ms at 8/16k). Force 10ms internally.
+        if (frameMs != 10) {
+            Log.w(TAG, "AECM requires 10ms frames; overriding requested frameMs=$frameMs to 10ms")
+        }
+        this.frameMs = 10
+        this.framesPerBuffer = sampleRate * this.frameMs / 1000
+        // Determine AECM frame size (must be 80 or 160 samples)
+        aecmFrameSamples = when (sampleRate) {
+            8000 -> 80
+            16000 -> 160
+            else -> {
+                Log.w(TAG, "Unsupported sampleRate=$sampleRate for AECM. Forcing 16k and 160-sample frames")
+                this.sampleRate = DEFAULT_SAMPLE_RATE
+                160
+            }
+        }
         this.enableNs = enableNs
         this.echoMode = echoMode
         this.cngMode = cngMode
@@ -76,12 +94,21 @@ class AecEngine {
                 ns = WebRtcNs(sampleRate, 2) // Mode 2 = Aggressive
             }
 
-            Log.i(TAG, "AecEngine initialized: sampleRate=$sampleRate, frameMs=$frameMs, enableNs=$enableNs")
+            Log.i(TAG, "AecEngine initialized: sampleRate=${this.sampleRate}, frameMs=${this.frameMs}, framesPerBuffer=$framesPerBuffer (aecmFrameSamples=$aecmFrameSamples), enableNs=$enableNs, echoMode=$echoMode, cngMode=$cngMode")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize AecEngine", e)
             false
         }
+    }
+
+    /**
+     * Provide an estimated playback delay (ms) when NOT using the internal native playback.
+     * Call this early (after audio output engine init) so AEC can use a realistic latency value.
+     */
+    fun setExternalPlaybackDelay(delayMs: Int) {
+        externalPlaybackDelayMs = delayMs.coerceAtLeast(0)
+        Log.i(TAG, "External playback delay set: $externalPlaybackDelayMs ms")
     }
 
     fun setOnProcessedFrameListener(listener: (ByteArray) -> Unit) {
@@ -216,27 +243,36 @@ class AecEngine {
     }
 
     fun bufferFarend(pcmData: ByteArray) {
-        if (pcmData.size != framesPerBuffer * 2) {
-            Log.w(TAG, "Invalid farend frame size: ${pcmData.size}, expected: ${framesPerBuffer * 2}")
+        if (pcmData.isEmpty()) return
+
+        // Accept multiples of aecmFrameSamples * 2; split as needed
+        if (pcmData.size % (aecmFrameSamples * 2) != 0) {
+            Log.w(TAG, "Farend bytes length=${pcmData.size} not multiple of AECM frame (${aecmFrameSamples * 2} bytes). Dropping.")
             return
         }
-
-        // Convert bytes to shorts
-        val shortArray = ShortArray(framesPerBuffer)
-        for (i in 0 until framesPerBuffer) {
-            val index = i * 2
-            shortArray[i] = ((pcmData[index + 1].toInt() shl 8) or (pcmData[index].toInt() and 0xFF)).toShort()
+        var offset = 0
+        while (offset < pcmData.size) {
+            val shortArray = ShortArray(aecmFrameSamples)
+            var si = 0
+            var bi = offset
+            while (si < aecmFrameSamples) {
+                shortArray[si] = ((pcmData[bi + 1].toInt() shl 8) or (pcmData[bi].toInt() and 0xFF)).toShort()
+                si++
+                bi += 2
+            }
+            farEndQueue.offer(shortArray)
+            // Feed immediately to AECM to keep internal buffer fresh
+            aecm?.bufferFarend(shortArray, shortArray.size)
+            offset += aecmFrameSamples * 2
         }
-
-        farEndQueue.offer(shortArray)
-        
-        // Keep queue bounded
-        while (farEndQueue.size > 10) {
+        val qSize = farEndQueue.size
+        if (qSize % 50 == 0) {
+            Log.d(TAG, "Far-end queue size=$qSize (every 50th enqueue)")
+        }
+        // Bound queue to a few frames (keep latency small)
+        while (farEndQueue.size > 6) {
             farEndQueue.poll()
         }
-
-        // Feed to AECM
-        aecm?.bufferFarend(shortArray, shortArray.size)
     }
 
     private fun captureLoop() {
@@ -260,35 +296,41 @@ class AecEngine {
 
     private fun processNearendFrame(nearendFrame: ShortArray) {
         try {
-            var processedFrame = nearendFrame
-            
-            // Apply noise suppression if enabled
-            if (enableNs && ns != null) {
-                val nsResult = ns!!.process(nearendFrame, frameMs)
-                if (nsResult != null) {
-                    processedFrame = nsResult
+            // If input frame is larger (e.g. 20ms), slice into 10ms AECM frames
+            if (nearendFrame.size % aecmFrameSamples != 0) {
+                Log.w(TAG, "Near-end frame size=${nearendFrame.size} not multiple of AECM frame=$aecmFrameSamples; dropping")
+                return
+            }
+            var offset = 0
+            while (offset < nearendFrame.size) {
+                val subFrame = if (nearendFrame.size == aecmFrameSamples) nearendFrame else nearendFrame.copyOfRange(offset, offset + aecmFrameSamples)
+                var processedFrame = subFrame
+                // Noise suppression (expects 10ms frame)
+                if (enableNs && ns != null) {
+                    val nsResult = ns!!.process(processedFrame, frameMs)
+                    if (nsResult != null && nsResult.size == processedFrame.size) {
+                        processedFrame = nsResult
+                    }
                 }
-            }
-
-            // Apply AEC
-            val totalDelay = recordDelayMs + playDelayMs
-            val aecResult = aecm?.process(nearendFrame, processedFrame, processedFrame.size, totalDelay)
-            
-            if (aecResult != null) {
-                processedFrame = aecResult
-            }
-
-            // Convert to bytes and emit
-            val byteArray = ByteArray(processedFrame.size * 2)
-            for (i in processedFrame.indices) {
-                val sample = processedFrame[i]
-                byteArray[i * 2] = (sample.toInt() and 0xFF).toByte()
-                byteArray[i * 2 + 1] = (sample.toInt() shr 8).toByte()
-            }
-
-            // Notify listener on main thread
-            Handler(Looper.getMainLooper()).post {
-                onProcessedFrameListener?.invoke(byteArray)
+                // Effective delay
+                val effectivePlayDelay = if (isPlaying.get()) playDelayMs else (externalPlaybackDelayMs ?: DEFAULT_EXTERNAL_PLAY_DELAY_MS)
+                val totalDelay = recordDelayMs + effectivePlayDelay
+                val aecResult = aecm?.process(subFrame, processedFrame, processedFrame.size, totalDelay)
+                if (aecResult == null) {
+                    Log.w(TAG, "AECM returned null (no echo cancellation this frame). totalDelay=$totalDelay, playDelayMs=$playDelayMs, externalDelay=$externalPlaybackDelayMs, subFrameSize=${subFrame.size}")
+                } else {
+                    processedFrame = aecResult
+                }
+                val byteArray = ByteArray(processedFrame.size * 2)
+                for (i in processedFrame.indices) {
+                    val sample = processedFrame[i]
+                    byteArray[i * 2] = (sample.toInt() and 0xFF).toByte()
+                    byteArray[i * 2 + 1] = (sample.toInt() shr 8).toByte()
+                }
+                Handler(Looper.getMainLooper()).post {
+                    onProcessedFrameListener?.invoke(byteArray)
+                }
+                offset += aecmFrameSamples
             }
 
         } catch (e: Exception) {

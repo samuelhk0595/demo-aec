@@ -82,11 +82,20 @@ class FlutterAecPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHan
         "bufferFarend" -> {
           val pcmData = call.argument<ByteArray>("pcmData")
           if (pcmData != null) {
+            if (pcmData.size % 640 == 0) {
+              Log.d(TAG, "bufferFarend received ${pcmData.size} bytes")
+            }
             aecEngine.bufferFarend(pcmData)
             result.success(true)
           } else {
             result.error("INVALID_ARGS", "pcmData is required", null)
           }
+        }
+        "setExternalPlaybackDelay" -> {
+          val delayMs = call.argument<Int>("delayMs") ?: 0
+          Log.d(TAG, "setExternalPlaybackDelay($delayMs)")
+          aecEngine.setExternalPlaybackDelay(delayMs)
+          result.success(true)
         }
         
         "dispose" -> {
