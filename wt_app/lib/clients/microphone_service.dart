@@ -44,9 +44,9 @@ class MicrophoneService {
       const config = AecConfig(
         sampleRate: 16000,
         frameMs: 20,
-        echoMode: 1,        // Default echo cancellation mode
+        echoMode: 3,        // Default echo cancellation mode
         cngMode: false,     // Disable comfort noise generation for walkie-talkie
-        enableNs: false,     // Enable noise suppression
+        enableNs: true,     // Enable noise suppression
       );
 
       final success = await _aec.initialize(config);
