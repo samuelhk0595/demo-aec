@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_aec/flutter_aec.dart';
 import '../clients/microphone_service.dart';
 import '../clients/audio_playback_service.dart';
@@ -38,7 +39,7 @@ class WalkieTalkieService {
   }
 
   void _initializeServices() {
-    print('[WalkieTalkieService] _initializeServices() called');
+    debugPrint('[WalkieTalkieService] _initializeServices() called');
     _microphoneService = MicrophoneService(
       onLog: _log,
       onError: _logError,
@@ -49,7 +50,7 @@ class WalkieTalkieService {
       onError: _logError,
     );
 
-    print('[WalkieTalkieService] Services initialized');
+    debugPrint('[WalkieTalkieService] Services initialized');
 
     _webSocketService = WebSocketService(
       onConnected: _onWebSocketConnected,
@@ -67,20 +68,20 @@ class WalkieTalkieService {
   }
 
   Future<void> initialize() async {
-    print('[WalkieTalkieService] initialize() called');
+    debugPrint('[WalkieTalkieService] initialize() called');
     try {
-      print('[WalkieTalkieService] Initializing audio playback service...');
+      debugPrint('[WalkieTalkieService] Initializing audio playback service...');
       await _audioPlaybackService.initAudioEngine();
       
       // Initialize AEC through microphone service
-      print('[WalkieTalkieService] Initializing AEC...');
+      debugPrint('[WalkieTalkieService] Initializing AEC...');
       await _microphoneService.initializeAec();
       
       _log('Services initialized with AEC support');
-      print('[WalkieTalkieService] All services initialized successfully');
+      debugPrint('[WalkieTalkieService] All services initialized successfully');
     } catch (e) {
       _logError('Error initializing services: $e');
-      print('[WalkieTalkieService] Exception in initialize: $e');
+      debugPrint('[WalkieTalkieService] Exception in initialize: $e');
     }
   }
 
@@ -89,10 +90,10 @@ class WalkieTalkieService {
   }
 
   Future<void> connect(String serverUrl, String nickname) async {
-    print('[WalkieTalkieService] connect() called with serverUrl: $serverUrl, nickname: $nickname');
+    debugPrint('[WalkieTalkieService] connect() called with serverUrl: $serverUrl, nickname: $nickname');
     if (_connectionStatus == ConnectionStatus.connecting || 
         _connectionStatus == ConnectionStatus.connected) {
-      print('[WalkieTalkieService] Already connecting/connected, skipping');
+      debugPrint('[WalkieTalkieService] Already connecting/connected, skipping');
       return;
     }
 
@@ -100,11 +101,11 @@ class WalkieTalkieService {
     _updateConnectionStatus(ConnectionStatus.connecting);
 
     try {
-      print('[WalkieTalkieService] Connecting to WebSocket...');
+      debugPrint('[WalkieTalkieService] Connecting to WebSocket...');
       await _webSocketService.connect(serverUrl, nickname);
     } catch (e) {
       _logError('Connection failed: $e');
-      print('[WalkieTalkieService] Connection failed: $e');
+      debugPrint('[WalkieTalkieService] Connection failed: $e');
       _updateConnectionStatus(ConnectionStatus.error);
     }
   }

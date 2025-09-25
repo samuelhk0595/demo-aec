@@ -15,7 +15,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
   late final WalkieTalkieService _walkieTalkieService;
   final TextEditingController _nicknameController = TextEditingController();
   final TextEditingController _serverController =
-      TextEditingController(text: 'ws://192.168.10.250:8080/ws');
+      TextEditingController(text: 'ws://wt.codemob.com.br/ws');
 
   bool _hasSetNickname = false;
   bool _isRecording = false;

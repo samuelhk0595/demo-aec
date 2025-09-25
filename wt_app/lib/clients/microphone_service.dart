@@ -47,7 +47,7 @@ class MicrophoneService {
         sampleRate: 16000,
         frameMs: 10,
         echoMode: 3,        // Default echo cancellation mode
-        cngMode: false,     // Disable comfort noise generation for walkie-talkie
+        cngMode: true,     // Disable comfort noise generation for walkie-talkie
         enableNs: true,     // Enable noise suppression
       );
 

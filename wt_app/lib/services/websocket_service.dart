@@ -7,7 +7,7 @@ class WebSocketService {
   WebSocketChannel? _channel;
   String? _nickname;
   bool _isConnected = false;
-  
+
   final void Function(String message)? onMessage;
   final void Function()? onConnected;
   final void Function()? onDisconnected;
@@ -30,7 +30,6 @@ class WebSocketService {
       _nickname = nickname;
       _channel = WebSocketChannel.connect(
         Uri.parse(serverUrl),
-        protocols: [],
       );
 
       _channel!.stream.listen(
