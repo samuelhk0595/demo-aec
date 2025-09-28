@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_aec/flutter_aec.dart';
 
 class AudioPlaybackService {
@@ -10,10 +11,25 @@ class AudioPlaybackService {
   bool _isPlaying = false;
   bool get isPlaying => _isPlaying;
 
+  bool _isPlayingAsset = false;
+  bool get isPlayingAsset => _isPlayingAsset;
+
+  Timer? _assetPlaybackTimer;
+  int _currentAssetPosition = 0;
+  Uint8List? _currentAssetData;
+
+  // Buffer for mixing audio streams
+  final List<int> _mixBuffer = [];
+  static const int _bufferSize = 320; // 10ms frame size
+
   final StreamController<bool> _playbackStateController =
       StreamController<bool>.broadcast();
 
+  final StreamController<bool> _assetPlaybackStateController =
+      StreamController<bool>.broadcast();
+
   Stream<bool> get playbackStateStream => _playbackStateController.stream;
+  Stream<bool> get assetPlaybackStateStream => _assetPlaybackStateController.stream;
 
   final VoidCallback? onPlay;
   final VoidCallback? onStop;
@@ -65,14 +81,77 @@ class AudioPlaybackService {
     }
 
     try {
-      // Feed incoming audio to AEC as far-end reference
-      // This must be done BEFORE or simultaneously with playback for optimal echo cancellation
-      _feedToAecFarEnd(audioData);
+      // Mix with current asset audio if playing
+      Uint8List finalAudioData;
+      if (_isPlayingAsset && _currentAssetData != null) {
+        finalAudioData = _mixAudioStreams(audioData, _getCurrentAssetChunk(audioData.length));
+        onLog?.call('⬇️ Playing mixed audio: WebSocket(${audioData.length}) + Asset mixed = ${finalAudioData.length} bytes');
+      } else {
+        finalAudioData = audioData;
+        onLog?.call('⬇️ Playing WebSocket audio: ${audioData.length} bytes (native AEC playback)');
+      }
 
-      onLog?.call('⬇️ Playing audio data: ${audioData.length} bytes (native AEC playback)');
+      // Feed mixed audio to AEC as far-end reference
+      _feedToAecFarEnd(finalAudioData);
+
     } catch (e) {
       onError?.call('Error playing audio: $e');
     }
+  }
+
+  Uint8List _mixAudioStreams(Uint8List stream1, Uint8List stream2) {
+    final int maxLength = stream1.length > stream2.length ? stream1.length : stream2.length;
+    final List<int> mixedData = [];
+
+    for (int i = 0; i < maxLength; i += 2) { // Process 16-bit samples (2 bytes each)
+      // Get 16-bit samples from both streams
+      int sample1 = 0;
+      if (i + 1 < stream1.length) {
+        sample1 = (stream1[i + 1] << 8) | stream1[i]; // Little-endian 16-bit
+        if (sample1 > 32767) sample1 -= 65536; // Convert to signed
+      }
+
+      int sample2 = 0;
+      if (i + 1 < stream2.length) {
+        sample2 = (stream2[i + 1] << 8) | stream2[i]; // Little-endian 16-bit
+        if (sample2 > 32767) sample2 -= 65536; // Convert to signed
+      }
+
+      // Mix the samples (simple addition with clipping)
+      int mixedSample = sample1 + sample2;
+      
+      // Clip to prevent overflow
+      if (mixedSample > 32767) mixedSample = 32767;
+      if (mixedSample < -32768) mixedSample = -32768;
+
+      // Convert back to unsigned 16-bit and add to output
+      if (mixedSample < 0) mixedSample += 65536;
+      mixedData.add(mixedSample & 0xFF);        // Low byte
+      mixedData.add((mixedSample >> 8) & 0xFF); // High byte
+    }
+
+    return Uint8List.fromList(mixedData);
+  }
+
+  Uint8List _getCurrentAssetChunk(int requestedLength) {
+    if (_currentAssetData == null || _currentAssetPosition >= _currentAssetData!.length) {
+      return Uint8List(requestedLength); // Return silence if no asset data
+    }
+
+    final int endPos = (_currentAssetPosition + requestedLength).clamp(0, _currentAssetData!.length);
+    final Uint8List chunk = _currentAssetData!.sublist(_currentAssetPosition, endPos);
+    
+    // Advance position for next call
+    _currentAssetPosition = endPos;
+    
+    // Pad with silence if chunk is shorter than requested
+    if (chunk.length < requestedLength) {
+      final paddedChunk = Uint8List(requestedLength);
+      paddedChunk.setAll(0, chunk);
+      return paddedChunk;
+    }
+    
+    return chunk;
   }
 
   void _feedToAecFarEnd(Uint8List audioData) {
@@ -128,6 +207,94 @@ class AudioPlaybackService {
     }
   }
 
+  Future<void> playAssetAudio(String assetPath) async {
+    if (_isPlayingAsset) {
+      onLog?.call('Asset already playing, stopping current playback');
+      await stopAssetAudio();
+    }
+
+    try {
+      // Load the asset file
+      final ByteData data = await rootBundle.load(assetPath);
+      final Uint8List audioBytes = data.buffer.asUint8List();
+      
+      onLog?.call('🎵 Loading asset: $assetPath (${audioBytes.length} bytes)');
+
+      // Skip WAV header (44 bytes) to get raw PCM data
+      // Assuming 16kHz, 16-bit, mono PCM data after header
+      const int wavHeaderSize = 44;
+      if (audioBytes.length <= wavHeaderSize) {
+        onError?.call('Audio file too small or invalid format');
+        return;
+      }
+
+      _currentAssetData = audioBytes.sublist(wavHeaderSize);
+      onLog?.call('🎵 Raw audio data loaded: ${_currentAssetData!.length} bytes');
+
+      if (!_aec.isInitialized) {
+        onError?.call('AEC not initialized');
+        return;
+      }
+
+      // Initialize AEC playback if not already started
+      if (!_isPlaying) {
+        final success = await initializeAecPlayback();
+        if (!success) {
+          onError?.call('Failed to initialize AEC playback');
+          return;
+        }
+      }
+
+      _isPlayingAsset = true;
+      _currentAssetPosition = 0;
+      _assetPlaybackStateController.add(true);
+      onLog?.call('🎵 Started asset audio mixing (will mix with incoming WebSocket audio)');
+
+      // Set up a timer to check when asset playback is complete
+      // The actual mixing happens in playAudioData() method
+      _assetPlaybackTimer = Timer.periodic(
+        Duration(milliseconds: 50), // Check every 50ms
+        (timer) {
+          if (_currentAssetPosition >= _currentAssetData!.length) {
+            // Asset playback completed
+            timer.cancel();
+            _finishAssetPlayback();
+          }
+        },
+      );
+
+    } catch (e) {
+      onError?.call('Error playing asset audio: $e');
+      _isPlayingAsset = false;
+      _assetPlaybackStateController.add(false);
+    }
+  }
+
+  Future<void> stopAssetAudio() async {
+    if (!_isPlayingAsset) return;
+
+    _assetPlaybackTimer?.cancel();
+    _assetPlaybackTimer = null;
+    
+    _isPlayingAsset = false;
+    _currentAssetPosition = 0;
+    _currentAssetData = null;
+    _assetPlaybackStateController.add(false);
+    
+    onLog?.call('🎵 Stopped asset audio mixing');
+  }
+
+  void _finishAssetPlayback() {
+    _isPlayingAsset = false;
+    _currentAssetPosition = 0;
+    _currentAssetData = null;
+    _assetPlaybackTimer?.cancel();
+    _assetPlaybackTimer = null;
+    _assetPlaybackStateController.add(false);
+    
+    onLog?.call('🎵 Asset audio playback completed');
+  }
+
   void clearAudioBuffer() {
     // No buffer to clear with native playback
     onLog?.call('Clear buffer requested (no-op with native playback)');
@@ -135,6 +302,8 @@ class AudioPlaybackService {
 
   void dispose() {
     stopPlayback();
+    stopAssetAudio();
     _playbackStateController.close();
+    _assetPlaybackStateController.close();
   }
 }

@@ -33,6 +33,8 @@ class WalkieTalkieService {
   ConnectionStatus get connectionStatus => _connectionStatus;
   String? get nickname => _nickname;
   bool get isMuted => _microphoneService.isMuted;
+  bool get isPlayingAsset => _audioPlaybackService.isPlayingAsset;
+  Stream<bool> get assetPlaybackStateStream => _audioPlaybackService.assetPlaybackStateStream;
 
   WalkieTalkieService() {
     _initializeServices();
@@ -148,6 +150,22 @@ class WalkieTalkieService {
   void toggleMute() {
     _microphoneService.toggleMute();
     _log('Microphone ${_microphoneService.isMuted ? 'muted' : 'unmuted'}');
+  }
+
+  Future<void> playAssetAudio(String assetPath) async {
+    try {
+      await _audioPlaybackService.playAssetAudio(assetPath);
+    } catch (e) {
+      _logError('Error playing asset audio: $e');
+    }
+  }
+
+  Future<void> stopAssetAudio() async {
+    try {
+      await _audioPlaybackService.stopAssetAudio();
+    } catch (e) {
+      _logError('Error stopping asset audio: $e');
+    }
   }
 
   void _onWebSocketConnected() {

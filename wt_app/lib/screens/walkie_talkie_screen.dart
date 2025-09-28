@@ -20,6 +20,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
   bool _hasSetNickname = false;
   bool _isRecording = false;
   bool _isContinuousMode = false;
+  bool _isPlayingVoice = false;
   List<String> _logs = [];
 
   // Animation and gesture tracking
@@ -55,6 +56,13 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
     // Listen to connection status changes
     _walkieTalkieService.connectionStatusStream.listen((status) {
       setState(() {});
+    });
+
+    // Listen to asset playback state changes
+    _walkieTalkieService.assetPlaybackStateStream.listen((isPlaying) {
+      setState(() {
+        _isPlayingVoice = isPlaying;
+      });
     });
 
     // Listen to logs
@@ -207,9 +215,12 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
     await _animationController.reverse();
   }
 
-  void _toggleMute() {
-    _walkieTalkieService.toggleMute();
-    setState(() {});
+  Future<void> _toggleVoicePlayback() async {
+    if (_isPlayingVoice) {
+      await _walkieTalkieService.stopAssetAudio();
+    } else {
+      await _walkieTalkieService.playAssetAudio('assets/audio/voice.wav');
+    }
   }
 
   String _getConnectionStatusText() {
@@ -470,17 +481,14 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen>
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                // Mute button
+                // Play Voice button
                 ElevatedButton.icon(
-                  onPressed: _toggleMute,
-                  icon: Icon(
-                      _walkieTalkieService.isMuted ? Icons.mic_off : Icons.mic),
-                  label: Text(_walkieTalkieService.isMuted ? 'Unmute' : 'Mute'),
+                  onPressed: _toggleVoicePlayback,
+                  icon: Icon(_isPlayingVoice ? Icons.stop : Icons.play_arrow),
+                  label: Text(_isPlayingVoice ? 'Stop' : 'Play Voice'),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor:
-                        _walkieTalkieService.isMuted ? Colors.red : null,
-                    foregroundColor:
-                        _walkieTalkieService.isMuted ? Colors.white : null,
+                    backgroundColor: _isPlayingVoice ? Colors.red : Colors.green,
+                    foregroundColor: Colors.white,
                   ),
                 ),
 
