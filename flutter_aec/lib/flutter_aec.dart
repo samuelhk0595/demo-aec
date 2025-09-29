@@ -3,6 +3,56 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
+/// Configuration for the WebRTC Voice Activity Detector.
+class VadConfig {
+  /// Whether the VAD should be enabled.
+  final bool enabled;
+
+  /// Aggressiveness mode (0-3) where higher is more restrictive.
+  final int mode;
+
+  /// Frame duration (ms) fed into the VAD. Supported: 10, 20, 30.
+  final int frameMs;
+
+  /// Duration (ms) to keep reporting speech after the last detection.
+  final int hangoverMs;
+
+  /// Whether hangover behaviour is enabled.
+  final bool hangoverEnabled;
+
+  const VadConfig({
+    this.enabled = false,
+    this.mode = 2,
+    this.frameMs = 30,
+    this.hangoverMs = 300,
+    this.hangoverEnabled = true,
+  });
+
+  VadConfig copyWith({
+    bool? enabled,
+    int? mode,
+    int? frameMs,
+    int? hangoverMs,
+    bool? hangoverEnabled,
+  }) {
+    return VadConfig(
+      enabled: enabled ?? this.enabled,
+      mode: mode ?? this.mode,
+      frameMs: frameMs ?? this.frameMs,
+      hangoverMs: hangoverMs ?? this.hangoverMs,
+      hangoverEnabled: hangoverEnabled ?? this.hangoverEnabled,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+        'enabled': enabled,
+        'mode': mode,
+        'frameMs': frameMs,
+        'hangoverMs': hangoverMs,
+        'hangoverEnabled': hangoverEnabled,
+      };
+}
+
 /// Configuration class for AEC engine initialization
 class AecConfig {
   /// Sample rate in Hz (16000 recommended)
@@ -20,12 +70,16 @@ class AecConfig {
   /// Enable noise suppression
   final bool enableNs;
 
+  /// Voice activity detector configuration.
+  final VadConfig vadConfig;
+
   const AecConfig({
     this.sampleRate = 16000,
     this.frameMs = 20,
     this.echoMode = 3,
     this.cngMode = false,
     this.enableNs = true,
+    this.vadConfig = const VadConfig(),
   });
 
   /// Calculate frame size in bytes (PCM16 mono)
@@ -33,6 +87,50 @@ class AecConfig {
   
   /// Calculate frame size in samples
   int get frameSizeSamples => sampleRate * frameMs ~/ 1000;
+}
+
+/// Event dispatched whenever voice activity state changes.
+class VoiceActivityEvent {
+  /// True when speech is currently detected.
+  final bool isActive;
+
+  /// Timestamp (UTC) when this decision was made.
+  final DateTime timestamp;
+
+  /// Aggressiveness mode used by the detector.
+  final int mode;
+
+  /// Frame size (ms) used for VAD processing.
+  final int frameMs;
+
+  /// Hangover duration (ms) configured for VAD.
+  final int hangoverMs;
+
+  const VoiceActivityEvent({
+    required this.isActive,
+    required this.timestamp,
+    required this.mode,
+    required this.frameMs,
+    required this.hangoverMs,
+  });
+
+  factory VoiceActivityEvent.fromMap(Map<dynamic, dynamic> map) {
+    final timestampMs = map['timestampMs'];
+    final intTimestamp = timestampMs is int
+        ? timestampMs
+        : (timestampMs is double ? timestampMs.round() : DateTime.now().millisecondsSinceEpoch);
+    return VoiceActivityEvent(
+      isActive: map['active'] == true,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(intTimestamp, isUtc: true),
+      mode: map['mode'] is int ? map['mode'] as int : 2,
+      frameMs: map['frameMs'] is int ? map['frameMs'] as int : 30,
+      hangoverMs: map['hangoverMs'] is int ? map['hangoverMs'] as int : 300,
+    );
+  }
+
+  @override
+  String toString() =>
+      'VoiceActivityEvent(isActive: $isActive, timestamp: $timestamp, mode: $mode, frameMs: $frameMs, hangoverMs: $hangoverMs)';
 }
 
 /// Main Flutter AEC plugin class
@@ -45,12 +143,18 @@ class FlutterAec {
       MethodChannel('com.neodent.flutter_aec/methods');
   static const EventChannel _eventChannel = 
       EventChannel('com.neodent.flutter_aec/processed_frames');
+  static const EventChannel _vadEventChannel = 
+    EventChannel('com.neodent.flutter_aec/vad_events');
 
   static FlutterAec? _instance;
   StreamSubscription<dynamic>? _processedFrameSubscription;
   StreamController<Uint8List>? _processedFrameController;
+  StreamSubscription<dynamic>? _vadEventSubscription;
+  StreamController<VoiceActivityEvent>? _vadEventController;
+  void Function(VoiceActivityEvent event)? _vadCallback;
   
   AecConfig? _config;
+  VadConfig? _vadConfig;
   bool _isInitialized = false;
   bool _isCaptureStarted = false;
   bool _isPlaybackStarted = false;
@@ -75,13 +179,24 @@ class FlutterAec {
     return _processedFrameController!.stream;
   }
 
+  /// Stream emitting voice activity state changes.
+  Stream<VoiceActivityEvent> get voiceActivityStream {
+    _vadEventController ??= StreamController<VoiceActivityEvent>.broadcast();
+    return _vadEventController!.stream;
+  }
+
+  /// Register a callback that runs whenever the voice activity state changes.
+  void setVoiceActivityCallback(void Function(VoiceActivityEvent event)? callback) {
+    _vadCallback = callback;
+  }
+
   /// Initialize the AEC engine with the specified configuration
   /// 
   /// Must be called before any other operations. Returns true if successful.
   /// 
   /// [config] - AEC configuration parameters
   Future<bool> initialize([AecConfig config = const AecConfig()]) async {
-    print('[FlutterAec] initialize() called with config: sampleRate=${config.sampleRate}, frameMs=${config.frameMs}, echoMode=${config.echoMode}, cngMode=${config.cngMode}, enableNs=${config.enableNs}');
+    print('[FlutterAec] initialize() called with config: sampleRate=${config.sampleRate}, frameMs=${config.frameMs}, echoMode=${config.echoMode}, cngMode=${config.cngMode}, enableNs=${config.enableNs}, vadEnabled=${config.vadConfig.enabled}');
     
     if (_isInitialized) {
       print('[FlutterAec] Already initialized, skipping');
@@ -96,12 +211,14 @@ class FlutterAec {
         'echoMode': config.echoMode,
         'cngMode': config.cngMode,
         'enableNs': config.enableNs,
+        'vadConfig': config.vadConfig.toMap(),
       });
 
       print('[FlutterAec] Native initialize returned: $result');
 
       if (result == true) {
         _config = config;
+        _vadConfig = config.vadConfig;
         _isInitialized = true;
         _setupEventStream();
         print('[FlutterAec] AEC engine initialized successfully');
@@ -195,6 +312,40 @@ class FlutterAec {
     }
   }
 
+  /// Update the VAD configuration while the engine is running.
+  Future<bool> configureVad(VadConfig config) async {
+    _checkInitialized();
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('configureVad', {
+        'config': config.toMap(),
+      });
+      if (result == true) {
+        _vadConfig = config;
+      }
+      return result ?? false;
+    } catch (e) {
+      print('[FlutterAec] Exception in configureVad: $e');
+      throw AecException('Failed to configure VAD: $e');
+    }
+  }
+
+  /// Enable or disable the VAD without changing other parameters.
+  Future<bool> setVadEnabled(bool enabled) async {
+    _checkInitialized();
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('setVadEnabled', {
+        'enabled': enabled,
+      });
+      if (result == true && _vadConfig != null) {
+        _vadConfig = _vadConfig!.copyWith(enabled: enabled);
+      }
+      return result ?? false;
+    } catch (e) {
+      print('[FlutterAec] Exception in setVadEnabled: $e');
+      throw AecException('Failed to toggle VAD: $e');
+    }
+  }
+
   /// Stop native audio capture
   Future<void> stopNativeCapture() async {
     print('[FlutterAec] stopNativeCapture() called');
@@ -276,10 +427,16 @@ class FlutterAec {
 
       _processedFrameSubscription?.cancel();
       _processedFrameController?.close();
+      _vadEventSubscription?.cancel();
+      _vadEventController?.close();
       
       _processedFrameSubscription = null;
       _processedFrameController = null;
+      _vadEventSubscription = null;
+      _vadEventController = null;
       _config = null;
+      _vadConfig = null;
+      _vadCallback = null;
       _isInitialized = false;
       _isCaptureStarted = false;
       _isPlaybackStarted = false;
@@ -300,10 +457,47 @@ class FlutterAec {
   /// Check if playback is active  
   bool get isPlaybackStarted => _isPlaybackStarted;
 
+  /// Current VAD configuration, if the engine has been initialized.
+  VadConfig? get vadConfig => _vadConfig;
+
+  /// Query the native layer for the current VAD state.
+  Future<VoiceActivityEvent?> getCurrentVadState() async {
+    _checkInitialized();
+    try {
+      final response = await _methodChannel.invokeMapMethod<String, dynamic>('getVadState');
+      if (response == null) {
+        return null;
+      }
+      final active = response['active'] == true;
+      final configMap = response['config'];
+      if (configMap is Map) {
+        _vadConfig = VadConfig(
+          enabled: configMap['enabled'] == true,
+          mode: configMap['mode'] is int ? configMap['mode'] as int : _vadConfig?.mode ?? 2,
+          frameMs: configMap['frameMs'] is int ? configMap['frameMs'] as int : _vadConfig?.frameMs ?? 30,
+          hangoverMs: configMap['hangoverMs'] is int ? configMap['hangoverMs'] as int : _vadConfig?.hangoverMs ?? 300,
+          hangoverEnabled: configMap['hangoverEnabled'] != false,
+        );
+      }
+      return VoiceActivityEvent(
+        isActive: active,
+        timestamp: DateTime.now().toUtc(),
+        mode: _vadConfig?.mode ?? 2,
+        frameMs: _vadConfig?.frameMs ?? 30,
+        hangoverMs: _vadConfig?.hangoverMs ?? 300,
+      );
+    } catch (e) {
+      print('[FlutterAec] Exception in getCurrentVadState: $e');
+      throw AecException('Failed to query VAD state: $e');
+    }
+  }
+
   void _setupEventStream() {
     print('[FlutterAec] Setting up event stream...');
     _processedFrameController ??= StreamController<Uint8List>.broadcast();
+    _vadEventController ??= StreamController<VoiceActivityEvent>.broadcast();
     
+    _processedFrameSubscription?.cancel();
     _processedFrameSubscription = _eventChannel
         .receiveBroadcastStream()
         .cast<Uint8List>()
@@ -322,7 +516,38 @@ class FlutterAec {
             print('[FlutterAec] Event stream finished');
           },
         );
+
+    _vadEventSubscription?.cancel();
+    _vadEventSubscription = _vadEventChannel
+        .receiveBroadcastStream()
+        .cast<Map<dynamic, dynamic>>()
+        .listen(
+          _handleVadPayload,
+          onError: (error) {
+            print('[FlutterAec] VAD stream error: $error');
+            _vadEventController?.addError(
+              AecException('VAD event stream error: $error')
+            );
+          },
+          onDone: () {
+            print('[FlutterAec] VAD event stream finished');
+          },
+        );
     print('[FlutterAec] Event stream setup complete');
+  }
+
+  void _handleVadPayload(Map<dynamic, dynamic> event) {
+    try {
+      final mapped = VoiceActivityEvent.fromMap(event);
+      _vadEventController?.add(mapped);
+      final callback = _vadCallback;
+      if (callback != null) {
+        callback(mapped);
+      }
+    } catch (e, stack) {
+      print('[FlutterAec] Failed to parse VAD payload: $e');
+      _vadEventController?.addError(e, stack);
+    }
   }
 
   void _checkInitialized() {

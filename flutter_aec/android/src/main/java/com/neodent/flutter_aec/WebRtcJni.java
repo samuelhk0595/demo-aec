@@ -21,6 +21,7 @@ public class WebRtcJni {
             }
             WebRtcVad_Init(ctx);
             WebRtcVad_set_mode(ctx,mode);
+            this.mode = mode;
         }
 
         /**
@@ -46,7 +47,7 @@ public class WebRtcJni {
          * @return 如果有声音就返回true
          */
         public boolean process(int fs,short[] audio_frame){
-            return process(fs,audio_frame,true);
+            return process(fs, audio_frame, hangoverEnabled, hangoverDurationMs);
         }
 
         /**
@@ -57,17 +58,93 @@ public class WebRtcJni {
          * @return 如果有声音就返回true
          */
         public boolean process(int fs,short[] audio_frame ,boolean delay){
-            if(1 != WebRtcVad_Process(ctx,fs,audio_frame)){
-                //无声音，如果静音计时超过3秒,则认为真的无声音
-                return delay ? ticker.elapsedTime() < 3 * 1000 : false;
+            return process(fs, audio_frame, delay, hangoverDurationMs);
+        }
+
+        /**
+         * 判断是否有声音
+         * @param fs 采样率(Hz: 8000, 16000, or 32000)
+         * @param audio_frame 音频数据
+         * @param delay 是否启用静音挂起(延迟)
+         * @param hangoverMs 静音挂起时间（毫秒）
+         * @return 如果有声音就返回true
+         */
+        public synchronized boolean process(int fs, short[] audio_frame, boolean delay, int hangoverMs){
+            this.hangoverEnabled = delay;
+            this.hangoverDurationMs = Math.max(hangoverMs, 0);
+            return doProcess(fs, audio_frame);
+        }
+
+        /**
+         * 更新VAD模式
+         * @param mode 激进程度(0, 1, 2, or 3)
+         */
+        public synchronized void setMode(int mode){
+            WebRtcVad_set_mode(ctx, mode);
+            this.mode = mode;
+        }
+
+        /**
+         * 设置静音挂起时间
+         * @param hangoverMs 挂起时间（毫秒）
+         */
+        public synchronized void setHangoverDurationMs(int hangoverMs){
+            this.hangoverDurationMs = Math.max(hangoverMs, 0);
+        }
+
+        /**
+         * 启用/禁用静音挂起
+         */
+        public synchronized void setHangoverEnabled(boolean enabled){
+            this.hangoverEnabled = enabled;
+        }
+
+        /**
+         * 重置内部状态
+         */
+        public synchronized void reset(){
+            lastVoiceTimestampMs = -1;
+            ticker.resetTime();
+        }
+
+        public synchronized int getMode(){
+            return mode;
+        }
+
+        public synchronized int getHangoverDurationMs(){
+            return hangoverDurationMs;
+        }
+
+        public synchronized boolean isHangoverEnabled(){
+            return hangoverEnabled;
+        }
+
+        private boolean doProcess(int fs, short[] audio_frame){
+            int vadResult = WebRtcVad_Process(ctx, fs, audio_frame);
+            if (vadResult == 1){
+                lastVoiceTimestampMs = System.currentTimeMillis();
+                ticker.resetTime();
+                return true;
             }
 
-            //有声音,重置静音计时器
-            ticker.resetTime();
-            return true;
+            if(!hangoverEnabled){
+                return false;
+            }
+
+            if(lastVoiceTimestampMs < 0){
+                return false;
+            }
+
+            long elapsed = System.currentTimeMillis() - lastVoiceTimestampMs;
+            return elapsed < hangoverDurationMs;
         }
+
         private long ctx = 0;
-        private Ticker ticker = new Ticker();
+        private int mode = 0;
+        private boolean hangoverEnabled = true;
+        private int hangoverDurationMs = 300;
+        private long lastVoiceTimestampMs = -1;
+        private final Ticker ticker = new Ticker();
     }
 
 

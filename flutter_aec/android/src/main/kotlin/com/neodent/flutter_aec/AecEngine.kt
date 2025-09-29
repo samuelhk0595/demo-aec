@@ -14,6 +14,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.neodent.flutter_aec.WebRtcJni.WebRtcAecm
 import com.neodent.flutter_aec.WebRtcJni.WebRtcNs
+import com.neodent.flutter_aec.WebRtcJni.WebRtcVad
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -28,6 +29,14 @@ class AecEngine {
         // Fallback playback delay guess (ms) when using external playback pipeline
         private const val DEFAULT_EXTERNAL_PLAY_DELAY_MS = 60
     }
+
+    data class VadEvent(
+        val active: Boolean,
+        val timestampMs: Long,
+        val mode: Int,
+        val frameMs: Int,
+        val hangoverMs: Int
+    )
 
     private var sampleRate = DEFAULT_SAMPLE_RATE
     private var frameMs = DEFAULT_FRAME_MS
@@ -47,22 +56,40 @@ class AecEngine {
 
     private var aecm: WebRtcAecm? = null
     private var ns: WebRtcNs? = null
+    private var vad: WebRtcVad? = null
 
     private var recordDelayMs = 0
     private var playDelayMs = 0
     private var externalPlaybackDelayMs: Int? = null
 
     private val farEndQueue = ConcurrentLinkedQueue<ShortArray>()
-    private val processedFrameQueue = ConcurrentLinkedQueue<ByteArray>()
 
     private var onProcessedFrameListener: ((ByteArray) -> Unit)? = null
+    private var onVadEventListener: ((VadEvent) -> Unit)? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var vadEnabled = false
+    private var vadMode = 2
+    private var vadFrameMs = 30
+    private var vadFrameSamples = 0
+    private var vadHangoverMs = 300
+    private var vadHangoverEnabled = true
+    private var vadActive = false
+    private var vadBuffer: ShortArray? = null
+    private var vadBufferIndex = 0
 
     fun initialize(
         sampleRate: Int = DEFAULT_SAMPLE_RATE,
         frameMs: Int = DEFAULT_FRAME_MS,
         echoMode: Int = 3,
         cngMode: Boolean = false,
-        enableNs: Boolean = true
+        enableNs: Boolean = true,
+        vadEnabled: Boolean = false,
+        vadMode: Int = 2,
+        vadFrameMs: Int = 30,
+        vadHangoverMs: Int = 300,
+        vadHangoverEnabled: Boolean = true
     ): Boolean {
         this.sampleRate = sampleRate
         // AECM only supports 80 or 160 sample frames (i.e. 10ms at 8/16k). Force 10ms internally.
@@ -94,6 +121,18 @@ class AecEngine {
                 ns = WebRtcNs(sampleRate, 2) // Mode 2 = Aggressive
             }
 
+            val vadConfigured = configureVad(
+                enabled = vadEnabled,
+                mode = vadMode,
+                frameMs = vadFrameMs,
+                hangoverMs = vadHangoverMs,
+                hangoverEnabled = vadHangoverEnabled,
+                fromInitialize = true
+            )
+            if (!vadConfigured && vadEnabled) {
+                Log.w(TAG, "VAD requested but failed to initialize; continuing without VAD")
+            }
+
             Log.i(TAG, "AecEngine initialized: sampleRate=${this.sampleRate}, frameMs=${this.frameMs}, framesPerBuffer=$framesPerBuffer (aecmFrameSamples=$aecmFrameSamples), enableNs=$enableNs, echoMode=$echoMode, cngMode=$cngMode")
             true
         } catch (e: Exception) {
@@ -113,6 +152,153 @@ class AecEngine {
 
     fun setOnProcessedFrameListener(listener: (ByteArray) -> Unit) {
         onProcessedFrameListener = listener
+    }
+
+    fun setOnVadEventListener(listener: ((VadEvent) -> Unit)?) {
+        onVadEventListener = listener
+    }
+
+    @Synchronized
+    fun configureVad(
+        enabled: Boolean,
+        mode: Int,
+        frameMs: Int,
+        hangoverMs: Int,
+        hangoverEnabled: Boolean,
+        fromInitialize: Boolean = false
+    ): Boolean {
+        vadEnabled = enabled
+        vadMode = mode.coerceIn(0, 3)
+        vadFrameMs = when (frameMs) {
+            10, 20, 30 -> frameMs
+            else -> {
+                Log.w(TAG, "Unsupported VAD frameMs=$frameMs. Using 30ms")
+                30
+            }
+        }
+        vadHangoverMs = hangoverMs.coerceAtLeast(0)
+        vadHangoverEnabled = hangoverEnabled
+        vadFrameSamples = (sampleRate * vadFrameMs) / 1000
+
+        if (vadFrameSamples <= 0) {
+            Log.w(TAG, "Invalid VAD frame sample count: $vadFrameSamples. Disabling VAD")
+            if (vadActive) {
+                emitVadState(false, force = true)
+            }
+            releaseVad()
+            return false
+        }
+
+        vadBuffer = ShortArray(vadFrameSamples)
+        vadBufferIndex = 0
+
+        if (!enabled) {
+            if (vadActive) {
+                emitVadState(false, force = true)
+            }
+            releaseVad()
+            return true
+        }
+
+        return try {
+            if (vad == null) {
+                vad = WebRtcVad(vadMode)
+            } else {
+                vad?.setMode(vadMode)
+            }
+            vad?.setHangoverEnabled(vadHangoverEnabled)
+            vad?.setHangoverDurationMs(vadHangoverMs)
+            vad?.reset()
+            if (!fromInitialize) {
+                emitVadState(false, force = true)
+            } else {
+                vadActive = false
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error configuring VAD", e)
+            emitVadState(false, force = vadActive)
+            releaseVad()
+            false
+        }
+    }
+
+    fun setVadEnabled(enabled: Boolean): Boolean {
+        return configureVad(
+            enabled = enabled,
+            mode = vadMode,
+            frameMs = vadFrameMs,
+            hangoverMs = vadHangoverMs,
+            hangoverEnabled = vadHangoverEnabled
+        )
+    }
+
+    fun currentVadConfig(): Map<String, Any?> = mapOf(
+        "enabled" to vadEnabled,
+        "mode" to vadMode,
+        "frameMs" to vadFrameMs,
+        "hangoverMs" to vadHangoverMs,
+        "hangoverEnabled" to vadHangoverEnabled
+    )
+
+    fun currentVadState(): Boolean = vadActive
+
+    private fun processVadSamples(frame: ShortArray) {
+        if (!vadEnabled) return
+        val localVad = vad ?: return
+        val targetSamples = vadFrameSamples
+        val buffer = vadBuffer ?: return
+        if (targetSamples <= 0) return
+
+        var offset = 0
+        while (offset < frame.size) {
+            val remaining = frame.size - offset
+            val copyCount = minOf(targetSamples - vadBufferIndex, remaining)
+            System.arraycopy(frame, offset, buffer, vadBufferIndex, copyCount)
+            vadBufferIndex += copyCount
+            offset += copyCount
+
+            if (vadBufferIndex == targetSamples) {
+                val isActive = try {
+                    localVad.process(sampleRate, buffer, vadHangoverEnabled, vadHangoverMs)
+                } catch (e: Exception) {
+                    Log.e(TAG, "VAD processing error", e)
+                    false
+                }
+                handleVadResult(isActive)
+                vadBufferIndex = 0
+            }
+        }
+    }
+
+    private fun handleVadResult(isActive: Boolean) {
+        if (!vadEnabled) return
+        emitVadState(isActive)
+    }
+
+    private fun emitVadState(isActive: Boolean, force: Boolean = false) {
+        if (!force && vadActive == isActive) {
+            return
+        }
+        vadActive = isActive
+        val event = VadEvent(
+            active = isActive,
+            timestampMs = System.currentTimeMillis(),
+            mode = vadMode,
+            frameMs = vadFrameMs,
+            hangoverMs = vadHangoverMs
+        )
+        mainHandler.post {
+            onVadEventListener?.invoke(event)
+        }
+    }
+
+    private fun releaseVad() {
+        vad?.release()
+        vad = null
+        vadActive = false
+        vadBuffer = null
+        vadBufferIndex = 0
     }
 
     fun startNativeCapture(context: Context): Boolean {
@@ -223,6 +409,10 @@ class AecEngine {
         audioRecord = null
 
         Log.i(TAG, "Native capture stopped")
+
+        if (vadEnabled && vadActive) {
+            emitVadState(false, force = true)
+        }
     }
 
     fun stopNativePlayback() {
@@ -321,13 +511,14 @@ class AecEngine {
                 } else {
                     processedFrame = aecResult
                 }
+                processVadSamples(processedFrame)
                 val byteArray = ByteArray(processedFrame.size * 2)
                 for (i in processedFrame.indices) {
                     val sample = processedFrame[i]
                     byteArray[i * 2] = (sample.toInt() and 0xFF).toByte()
                     byteArray[i * 2 + 1] = (sample.toInt() shr 8).toByte()
                 }
-                Handler(Looper.getMainLooper()).post {
+                mainHandler.post {
                     onProcessedFrameListener?.invoke(byteArray)
                 }
                 offset += aecmFrameSamples
@@ -364,8 +555,8 @@ class AecEngine {
         
         ns?.release()
         ns = null
+        releaseVad()
 
-        processedFrameQueue.clear()
         farEndQueue.clear()
         
         Log.i(TAG, "AecEngine disposed")
