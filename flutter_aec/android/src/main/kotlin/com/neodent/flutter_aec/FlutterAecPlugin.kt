@@ -89,6 +89,12 @@ class FlutterAecPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHan
           val vadFrameMs = vadConfig?.get("frameMs") as? Int ?: 30
           val vadHangoverMs = vadConfig?.get("hangoverMs") as? Int ?: 300
           val vadHangoverEnabled = vadConfig?.get("hangoverEnabled") as? Boolean ?: true
+          val agcConfig = call.argument<Map<String, Any?>>("agcConfig")
+          val agcEnabled = agcConfig?.get("enabled") as? Boolean ?: false
+          val agcMode = agcConfig?.get("mode") as? Int ?: 2
+          val agcTargetLevelDbfs = agcConfig?.get("targetLevelDbfs") as? Int ?: 3
+          val agcCompressionGainDb = agcConfig?.get("compressionGainDb") as? Int ?: 9
+          val agcEnableLimiter = agcConfig?.get("enableLimiter") as? Boolean ?: true
           
           val success = aecEngine.initialize(
             sampleRate,
@@ -100,7 +106,12 @@ class FlutterAecPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHan
             vadMode,
             vadFrameMs,
             vadHangoverMs,
-            vadHangoverEnabled
+            vadHangoverEnabled,
+            agcEnabled,
+            agcMode,
+            agcTargetLevelDbfs,
+            agcCompressionGainDb,
+            agcEnableLimiter
           )
           result.success(success)
         }
@@ -167,6 +178,27 @@ class FlutterAecPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHan
           result.success(success)
         }
 
+        "configureAgc" -> {
+          val config = call.argument<Map<String, Any?>>("config")
+          if (config == null) {
+            result.error("INVALID_ARGS", "config is required", null)
+          } else {
+            val enabled = config["enabled"] as? Boolean ?: false
+            val mode = config["mode"] as? Int ?: 2
+            val targetLevelDbfs = config["targetLevelDbfs"] as? Int ?: 3
+            val compressionGainDb = config["compressionGainDb"] as? Int ?: 9
+            val enableLimiter = config["enableLimiter"] as? Boolean ?: true
+            val success = aecEngine.configureAgc(enabled, mode, targetLevelDbfs, compressionGainDb, enableLimiter)
+            result.success(success)
+          }
+        }
+
+        "setAgcEnabled" -> {
+          val enabled = call.argument<Boolean>("enabled") ?: false
+          val success = aecEngine.setAgcEnabled(enabled)
+          result.success(success)
+        }
+
         "getVadState" -> {
           result.success(
             mapOf(
@@ -175,7 +207,15 @@ class FlutterAecPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHan
             )
           )
         }
-        
+
+        "getAgcState" -> {
+          result.success(
+            mapOf(
+              "config" to aecEngine.currentAgcConfig()
+            )
+          )
+        }
+
         "dispose" -> {
           aecEngine.dispose()
           result.success(true)

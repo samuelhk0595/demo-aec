@@ -7,9 +7,10 @@ Real-time Acoustic Echo Cancellation (AEC) and audio enhancement utilities for F
 - WebRTC Acoustic Echo Canceller Mobile (AECM) integration
 - Optional WebRTC Noise Suppression (NS)
 - **Voice Activity Detection (VAD)** powered by WebRTC with configurable sensitivity and hangover
+- **Automatic Gain Control (AGC)** for dynamic microphone level adjustment
 - Native Android capture/playback pipeline for low-latency VoIP and walkie-talkie scenarios
 
-> **Note:** VAD is currently implemented for Android. iOS support is planned.
+> **Note:** VAD and AGC are currently implemented for Android. iOS support is planned.
 
 ## 🚀 Getting Started
 
@@ -30,6 +31,13 @@ final config = AecConfig(
 		frameMs: 30,
 		hangoverMs: 300,
 		hangoverEnabled: true,
+	),
+	agcConfig: const AgcConfig(
+		enabled: true,
+		mode: 2,            // Adaptive digital
+		targetLevelDbfs: 3,
+		compressionGainDb: 9,
+		enableLimiter: true,
 	),
 );
 
@@ -103,13 +111,37 @@ Query the latest state reported by the native layer:
 ```dart
 final current = await aec.getCurrentVadState();
 if (current != null) {
-	debugPrint('VAD active: ${current.isActive}');
+  debugPrint('VAD active: ${current.isActive}');
 }
 ```
 
-Remember to clean up resources when finished:
+## 🎚️ Working with AGC
+
+AGC automatically adjusts microphone gain to maintain consistent audio levels:
 
 ```dart
+// Update AGC settings at runtime
+await aec.configureAgc(
+  const AgcConfig(
+    enabled: true,
+    mode: 2,              // 0=unchanged, 1=analog, 2=digital, 3=fixed
+    targetLevelDbfs: 3,   // Target output level (0-31 dBFS)
+    compressionGainDb: 9, // Max gain applied (0-90 dB)
+    enableLimiter: true,  // Prevent clipping
+  ),
+);
+
+// Quick toggle
+await aec.setAgcEnabled(false);
+
+// Query current AGC config
+final agcState = await aec.getCurrentAgcState();
+if (agcState != null) {
+  debugPrint('AGC enabled: ${agcState.enabled}, mode: ${agcState.mode}');
+}
+```
+
+Remember to clean up resources when finished:```dart
 await aec.stopNativeCapture();
 await aec.stopNativePlayback();
 await aec.dispose();

@@ -15,6 +15,7 @@ import androidx.core.content.ContextCompat
 import com.neodent.flutter_aec.WebRtcJni.WebRtcAecm
 import com.neodent.flutter_aec.WebRtcJni.WebRtcNs
 import com.neodent.flutter_aec.WebRtcJni.WebRtcVad
+import com.neodent.flutter_aec.WebRtcJni.WebRtcAgc
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -57,6 +58,7 @@ class AecEngine {
     private var aecm: WebRtcAecm? = null
     private var ns: WebRtcNs? = null
     private var vad: WebRtcVad? = null
+    private var agc: WebRtcAgc? = null
 
     private var recordDelayMs = 0
     private var playDelayMs = 0
@@ -79,6 +81,13 @@ class AecEngine {
     private var vadBuffer: ShortArray? = null
     private var vadBufferIndex = 0
 
+    private var agcEnabled = false
+    private var agcMode = 2
+    private var agcTargetLevelDbfs = 3
+    private var agcCompressionGainDb = 9
+    private var agcEnableLimiter = true
+    private var agcMicLevel = 100
+
     fun initialize(
         sampleRate: Int = DEFAULT_SAMPLE_RATE,
         frameMs: Int = DEFAULT_FRAME_MS,
@@ -89,7 +98,12 @@ class AecEngine {
         vadMode: Int = 2,
         vadFrameMs: Int = 30,
         vadHangoverMs: Int = 300,
-        vadHangoverEnabled: Boolean = true
+        vadHangoverEnabled: Boolean = true,
+        agcEnabled: Boolean = false,
+        agcMode: Int = 2,
+        agcTargetLevelDbfs: Int = 3,
+        agcCompressionGainDb: Int = 9,
+        agcEnableLimiter: Boolean = true
     ): Boolean {
         this.sampleRate = sampleRate
         // AECM only supports 80 or 160 sample frames (i.e. 10ms at 8/16k). Force 10ms internally.
@@ -133,7 +147,19 @@ class AecEngine {
                 Log.w(TAG, "VAD requested but failed to initialize; continuing without VAD")
             }
 
-            Log.i(TAG, "AecEngine initialized: sampleRate=${this.sampleRate}, frameMs=${this.frameMs}, framesPerBuffer=$framesPerBuffer (aecmFrameSamples=$aecmFrameSamples), enableNs=$enableNs, echoMode=$echoMode, cngMode=$cngMode")
+            val agcConfigured = configureAgc(
+                enabled = agcEnabled,
+                mode = agcMode,
+                targetLevelDbfs = agcTargetLevelDbfs,
+                compressionGainDb = agcCompressionGainDb,
+                enableLimiter = agcEnableLimiter,
+                fromInitialize = true
+            )
+            if (!agcConfigured && agcEnabled) {
+                Log.w(TAG, "AGC requested but failed to initialize; continuing without AGC")
+            }
+
+            Log.i(TAG, "AecEngine initialized: sampleRate=${this.sampleRate}, frameMs=${this.frameMs}, framesPerBuffer=$framesPerBuffer (aecmFrameSamples=$aecmFrameSamples), enableNs=$enableNs, echoMode=$echoMode, cngMode=$cngMode, vadEnabled=$vadEnabled, agcEnabled=$agcEnabled")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize AecEngine", e)
@@ -233,6 +259,54 @@ class AecEngine {
         )
     }
 
+    @Synchronized
+    fun configureAgc(
+        enabled: Boolean,
+        mode: Int,
+        targetLevelDbfs: Int,
+        compressionGainDb: Int,
+        enableLimiter: Boolean,
+        fromInitialize: Boolean = false
+    ): Boolean {
+        agcEnabled = enabled
+        agcMode = mode.coerceIn(0, 3)
+        agcTargetLevelDbfs = targetLevelDbfs.coerceIn(0, 31)
+        agcCompressionGainDb = compressionGainDb.coerceIn(0, 90)
+        agcEnableLimiter = enableLimiter
+
+        if (!enabled) {
+            releaseAgc()
+            return true
+        }
+
+        return try {
+            if (agc == null) {
+                agc = WebRtcAgc(0, 255, agcMode, sampleRate)
+            } else {
+                releaseAgc()
+                agc = WebRtcAgc(0, 255, agcMode, sampleRate)
+            }
+            agc?.setConfig(agcTargetLevelDbfs, agcCompressionGainDb, agcEnableLimiter)
+            agcMicLevel = 100
+            Log.i(TAG, "AGC configured: mode=$agcMode, targetLevel=$agcTargetLevelDbfs, compressionGain=$agcCompressionGainDb, limiter=$agcEnableLimiter")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error configuring AGC", e)
+            releaseAgc()
+            false
+        }
+    }
+
+    fun setAgcEnabled(enabled: Boolean): Boolean {
+        return configureAgc(
+            enabled = enabled,
+            mode = agcMode,
+            targetLevelDbfs = agcTargetLevelDbfs,
+            compressionGainDb = agcCompressionGainDb,
+            enableLimiter = agcEnableLimiter
+        )
+    }
+
     fun currentVadConfig(): Map<String, Any?> = mapOf(
         "enabled" to vadEnabled,
         "mode" to vadMode,
@@ -242,6 +316,14 @@ class AecEngine {
     )
 
     fun currentVadState(): Boolean = vadActive
+
+    fun currentAgcConfig(): Map<String, Any?> = mapOf(
+        "enabled" to agcEnabled,
+        "mode" to agcMode,
+        "targetLevelDbfs" to agcTargetLevelDbfs,
+        "compressionGainDb" to agcCompressionGainDb,
+        "enableLimiter" to agcEnableLimiter
+    )
 
     private fun processVadSamples(frame: ShortArray) {
         if (!vadEnabled) return
@@ -299,6 +381,12 @@ class AecEngine {
         vadActive = false
         vadBuffer = null
         vadBufferIndex = 0
+    }
+
+    private fun releaseAgc() {
+        agc?.release()
+        agc = null
+        agcMicLevel = 100
     }
 
     fun startNativeCapture(context: Context): Boolean {
@@ -453,6 +541,14 @@ class AecEngine {
             farEndQueue.offer(shortArray)
             // Feed immediately to AECM to keep internal buffer fresh
             aecm?.bufferFarend(shortArray, shortArray.size)
+            // Feed to AGC if enabled
+            if (agcEnabled && agc != null) {
+                try {
+                    agc!!.addFarend(shortArray, shortArray.size)
+                } catch (e: Exception) {
+                    Log.e(TAG, "AGC addFarend error", e)
+                }
+            }
             offset += aecmFrameSamples * 2
         }
         val qSize = farEndQueue.size
@@ -511,6 +607,21 @@ class AecEngine {
                 } else {
                     processedFrame = aecResult
                 }
+                
+                // AGC processing
+                if (agcEnabled && agc != null) {
+                    try {
+                        agc!!.addMic(processedFrame, processedFrame.size)
+                        val agcResult = agc!!.process(processedFrame, processedFrame.size, agcMicLevel, 0)
+                        if (agcResult.ret == 0 && agcResult.out != null) {
+                            processedFrame = agcResult.out
+                            agcMicLevel = agcResult.outMicLevel
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "AGC processing error", e)
+                    }
+                }
+                
                 processVadSamples(processedFrame)
                 val byteArray = ByteArray(processedFrame.size * 2)
                 for (i in processedFrame.indices) {
@@ -556,6 +667,7 @@ class AecEngine {
         ns?.release()
         ns = null
         releaseVad()
+        releaseAgc()
 
         farEndQueue.clear()
         

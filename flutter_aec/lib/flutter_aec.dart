@@ -53,6 +53,56 @@ class VadConfig {
       };
 }
 
+/// Configuration for the WebRTC Automatic Gain Control.
+class AgcConfig {
+  /// Whether AGC should be enabled.
+  final bool enabled;
+
+  /// AGC mode: 0=unchanged, 1=adaptive analog, 2=adaptive digital, 3=fixed digital (default: 2)
+  final int mode;
+
+  /// Target output level in dBFS (0-31, default: 3)
+  final int targetLevelDbfs;
+
+  /// Maximum compression gain in dB (0-90, default: 9)
+  final int compressionGainDb;
+
+  /// Enable output limiter to prevent clipping
+  final bool enableLimiter;
+
+  const AgcConfig({
+    this.enabled = false,
+    this.mode = 2,
+    this.targetLevelDbfs = 3,
+    this.compressionGainDb = 9,
+    this.enableLimiter = true,
+  });
+
+  AgcConfig copyWith({
+    bool? enabled,
+    int? mode,
+    int? targetLevelDbfs,
+    int? compressionGainDb,
+    bool? enableLimiter,
+  }) {
+    return AgcConfig(
+      enabled: enabled ?? this.enabled,
+      mode: mode ?? this.mode,
+      targetLevelDbfs: targetLevelDbfs ?? this.targetLevelDbfs,
+      compressionGainDb: compressionGainDb ?? this.compressionGainDb,
+      enableLimiter: enableLimiter ?? this.enableLimiter,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+        'enabled': enabled,
+        'mode': mode,
+        'targetLevelDbfs': targetLevelDbfs,
+        'compressionGainDb': compressionGainDb,
+        'enableLimiter': enableLimiter,
+      };
+}
+
 /// Configuration class for AEC engine initialization
 class AecConfig {
   /// Sample rate in Hz (16000 recommended)
@@ -73,6 +123,9 @@ class AecConfig {
   /// Voice activity detector configuration.
   final VadConfig vadConfig;
 
+  /// Automatic gain control configuration.
+  final AgcConfig agcConfig;
+
   const AecConfig({
     this.sampleRate = 16000,
     this.frameMs = 20,
@@ -80,6 +133,7 @@ class AecConfig {
     this.cngMode = false,
     this.enableNs = true,
     this.vadConfig = const VadConfig(),
+    this.agcConfig = const AgcConfig(),
   });
 
   /// Calculate frame size in bytes (PCM16 mono)
@@ -155,6 +209,7 @@ class FlutterAec {
   
   AecConfig? _config;
   VadConfig? _vadConfig;
+  AgcConfig? _agcConfig;
   bool _isInitialized = false;
   bool _isCaptureStarted = false;
   bool _isPlaybackStarted = false;
@@ -196,7 +251,7 @@ class FlutterAec {
   /// 
   /// [config] - AEC configuration parameters
   Future<bool> initialize([AecConfig config = const AecConfig()]) async {
-    print('[FlutterAec] initialize() called with config: sampleRate=${config.sampleRate}, frameMs=${config.frameMs}, echoMode=${config.echoMode}, cngMode=${config.cngMode}, enableNs=${config.enableNs}, vadEnabled=${config.vadConfig.enabled}');
+    print('[FlutterAec] initialize() called with config: sampleRate=${config.sampleRate}, frameMs=${config.frameMs}, echoMode=${config.echoMode}, cngMode=${config.cngMode}, enableNs=${config.enableNs}, vadEnabled=${config.vadConfig.enabled}, agcEnabled=${config.agcConfig.enabled}');
     
     if (_isInitialized) {
       print('[FlutterAec] Already initialized, skipping');
@@ -212,6 +267,7 @@ class FlutterAec {
         'cngMode': config.cngMode,
         'enableNs': config.enableNs,
         'vadConfig': config.vadConfig.toMap(),
+        'agcConfig': config.agcConfig.toMap(),
       });
 
       print('[FlutterAec] Native initialize returned: $result');
@@ -219,6 +275,7 @@ class FlutterAec {
       if (result == true) {
         _config = config;
         _vadConfig = config.vadConfig;
+        _agcConfig = config.agcConfig;
         _isInitialized = true;
         _setupEventStream();
         print('[FlutterAec] AEC engine initialized successfully');
@@ -228,7 +285,33 @@ class FlutterAec {
 
       return result ?? false;
     } catch (e) {
-      throw AecException('Failed to initialize AEC engine: $e');
+      throw AecException('Failed to query VAD state: $e');
+    }
+  }
+
+  /// Query the native layer for the current AGC configuration.
+  Future<AgcConfig?> getCurrentAgcState() async {
+    _checkInitialized();
+    try {
+      final response = await _methodChannel.invokeMapMethod<String, dynamic>('getAgcState');
+      if (response == null) {
+        return null;
+      }
+      final configMap = response['config'];
+      if (configMap is Map) {
+        _agcConfig = AgcConfig(
+          enabled: configMap['enabled'] == true,
+          mode: configMap['mode'] is int ? configMap['mode'] as int : _agcConfig?.mode ?? 2,
+          targetLevelDbfs: configMap['targetLevelDbfs'] is int ? configMap['targetLevelDbfs'] as int : _agcConfig?.targetLevelDbfs ?? 3,
+          compressionGainDb: configMap['compressionGainDb'] is int ? configMap['compressionGainDb'] as int : _agcConfig?.compressionGainDb ?? 9,
+          enableLimiter: configMap['enableLimiter'] != false,
+        );
+        return _agcConfig;
+      }
+      return _agcConfig;
+    } catch (e) {
+      print('[FlutterAec] Exception in getCurrentAgcState: $e');
+      throw AecException('Failed to query AGC state: $e');
     }
   }
 
@@ -346,6 +429,40 @@ class FlutterAec {
     }
   }
 
+  /// Update the AGC configuration while the engine is running.
+  Future<bool> configureAgc(AgcConfig config) async {
+    _checkInitialized();
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('configureAgc', {
+        'config': config.toMap(),
+      });
+      if (result == true) {
+        _agcConfig = config;
+      }
+      return result ?? false;
+    } catch (e) {
+      print('[FlutterAec] Exception in configureAgc: $e');
+      throw AecException('Failed to configure AGC: $e');
+    }
+  }
+
+  /// Enable or disable the AGC without changing other parameters.
+  Future<bool> setAgcEnabled(bool enabled) async {
+    _checkInitialized();
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('setAgcEnabled', {
+        'enabled': enabled,
+      });
+      if (result == true && _agcConfig != null) {
+        _agcConfig = _agcConfig!.copyWith(enabled: enabled);
+      }
+      return result ?? false;
+    } catch (e) {
+      print('[FlutterAec] Exception in setAgcEnabled: $e');
+      throw AecException('Failed to toggle AGC: $e');
+    }
+  }
+
   /// Stop native audio capture
   Future<void> stopNativeCapture() async {
     print('[FlutterAec] stopNativeCapture() called');
@@ -436,6 +553,7 @@ class FlutterAec {
       _vadEventController = null;
       _config = null;
       _vadConfig = null;
+      _agcConfig = null;
       _vadCallback = null;
       _isInitialized = false;
       _isCaptureStarted = false;
@@ -459,6 +577,9 @@ class FlutterAec {
 
   /// Current VAD configuration, if the engine has been initialized.
   VadConfig? get vadConfig => _vadConfig;
+
+  /// Current AGC configuration, if the engine has been initialized.
+  AgcConfig? get agcConfig => _agcConfig;
 
   /// Query the native layer for the current VAD state.
   Future<VoiceActivityEvent?> getCurrentVadState() async {
