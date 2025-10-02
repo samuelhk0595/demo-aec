@@ -213,6 +213,7 @@ class FlutterAec {
   bool _isInitialized = false;
   bool _isCaptureStarted = false;
   bool _isPlaybackStarted = false;
+  final initializeCompleter = Completer();
 
   /// Get singleton instance
   static FlutterAec get instance {
@@ -277,14 +278,17 @@ class FlutterAec {
         _vadConfig = config.vadConfig;
         _agcConfig = config.agcConfig;
         _isInitialized = true;
+        initializeCompleter.complete();
         _setupEventStream();
         print('[FlutterAec] AEC engine initialized successfully');
       } else {
         print('[FlutterAec] Native initialize failed');
+        initializeCompleter.completeError('Native initialize failed');
       }
 
       return result ?? false;
     } catch (e) {
+      initializeCompleter.completeError(e);
       throw AecException('Failed to query VAD state: $e');
     }
   }
