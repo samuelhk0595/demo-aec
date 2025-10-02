@@ -19,8 +19,8 @@ class AudioPlaybackService {
   Uint8List? _currentAssetData;
 
   // Buffer for mixing audio streams
-  final List<int> _mixBuffer = [];
-  static const int _bufferSize = 320; // 10ms frame size
+  // final List<int> _mixBuffer = [];
+  // static const int _bufferSize = 320; // 10ms frame size
 
   final StreamController<bool> _playbackStateController =
       StreamController<bool>.broadcast();
